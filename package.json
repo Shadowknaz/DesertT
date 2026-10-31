@@ -1,0 +1,24 @@
+{
+  "name": "ps1-desert-mech-diorama",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "PS1-style procedurally generated infinite desert with a four-legged mech (three.js + Rapier)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "node --test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@dimforge/rapier3d-compat": "^0.12.0",
+    "three": "^0.160.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/three": "^0.186.0",
+    "typescript": "^7.0.2",
+    "vite": "^5.4.21"
+  }
+}

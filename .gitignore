@@ -1,0 +1,5 @@
+node_modules/
+dist/
+.tmp-*.png
+/tmp-*.png
+*.log
