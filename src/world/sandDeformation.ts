@@ -21,6 +21,10 @@ export interface AttachedChunkRecord {
     color: THREE.BufferAttribute | null;
     baseY: Float32Array;
     baseColor: Float32Array | null;
+    // Нормали аналитического рельефа до локальных деформаций. Они нужны как
+    // базис для мирового пересчёта: нормаль на кромке должна видеть соседний
+    // чанк, а не замыкаться на последнюю строку текущего меша.
+    baseNormal: Float32Array | null;
     originX: number;
     originZ: number;
     physics: ChunkPhysicsSync | null;
@@ -42,15 +46,64 @@ export interface SandDeformer {
 }
 
 export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer {
-    // key -> { geometry, position, color, normal, baseY, baseColor, originX, originZ, physics }
+    // key -> { geometry, position, color, baseY, baseColor, baseNormal, originX, originZ, physics }
     const attached = new Map<string, AttachedChunkRecord>();
+
+    // Пересчитывает нормали в мировых координатах. `sampleNormal` берёт
+    // градиент деформации по обе стороны точки и тем самым корректно
+    // пересекает границу чанка. Аналитическая нормаль остаётся базисом,
+    // поэтому при нулевой деформации соседние меши получают одинаковый свет.
+    function refreshNormals(
+        rec: AttachedChunkRecord,
+        minRow: number,
+        maxRow: number,
+        minCol: number,
+        maxCol: number
+    ): void {
+        const normal = rec.geometry.attributes.normal as THREE.BufferAttribute | undefined;
+        const baseNormal = rec.baseNormal;
+        if (!normal || !baseNormal) return;
+
+        const out = new THREE.Vector3();
+        for (let r = minRow; r <= maxRow; r++) {
+            for (let c = minCol; c <= maxCol; c++) {
+                const i = r * N + c;
+                const base = {
+                    x: baseNormal[i * 3],
+                    y: baseNormal[i * 3 + 1],
+                    z: baseNormal[i * 3 + 2]
+                };
+                const worldX = rec.originX + rec.position.getX(i);
+                const worldZ = rec.originZ + rec.position.getZ(i);
+                if (typeof field.sampleNormal === 'function') {
+                    field.sampleNormal(worldX, worldZ, base, out);
+                    normal.setXYZ(i, out.x, out.y, out.z);
+                } else {
+                    // Совместимость с минимальными тестовыми полями без
+                    // sampleNormal: внутри чанка сохраняем старый fallback.
+                    const cL = Math.max(0, c - 1);
+                    const cR = Math.min(SEG, c + 1);
+                    const rD = Math.max(0, r - 1);
+                    const rU = Math.min(SEG, r + 1);
+                    const yL = rec.position.getY(r * N + cL);
+                    const yR = rec.position.getY(r * N + cR);
+                    const yD = rec.position.getY(rD * N + c);
+                    const yU = rec.position.getY(rU * N + c);
+                    const dx = (yR - yL) / ((cR - cL) * CELL || 1);
+                    const dz = (yU - yD) / ((rU - rD) * CELL || 1);
+                    const len = Math.hypot(-dx, 1.0, -dz) || 1.0;
+                    normal.setXYZ(i, -dx / len, 1.0 / len, -dz / len);
+                }
+            }
+        }
+        normal.needsUpdate = true;
+    }
 
     function flushRegion(rec: AttachedChunkRecord, grid: any, bounds: { minRow: number; maxRow: number; minCol: number; maxCol: number }): void {
         const position = rec.position;
         const color = rec.color;
         const baseColor = rec.baseColor;
         const baseY = rec.baseY;
-        const normal = rec.geometry.attributes.normal as THREE.BufferAttribute;
         const delta = grid.delta;
         const packing = grid.packing;
         const slipX = grid.slipX;
@@ -77,30 +130,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
             }
         }
 
-        // Локальный пересчет нормалей для измененной зоны и ее границы
-        if (normal) {
-            for (let r = minR; r <= maxR; r++) {
-                for (let c = minC; c <= maxC; c++) {
-                    const i = r * N + c;
-                    const cL = Math.max(0, c - 1);
-                    const cR = Math.min(SEG, c + 1);
-                    const rD = Math.max(0, r - 1);
-                    const rU = Math.min(SEG, r + 1);
-
-                    const yL = position.getY(r * N + cL);
-                    const yR = position.getY(r * N + cR);
-                    const yD = position.getY(rD * N + c);
-                    const yU = position.getY(rU * N + c);
-
-                    const dx = (yR - yL) / ((cR - cL) * CELL || 1);
-                    const dz = (yU - yD) / ((rU - rD) * CELL || 1);
-                    const len = Math.hypot(-dx, 1.0, -dz) || 1.0;
-
-                    normal.setXYZ(i, -dx / len, 1.0 / len, -dz / len);
-                }
-            }
-            normal.needsUpdate = true;
-        }
+        refreshNormals(rec, minR, maxR, minC, maxC);
 
         position.needsUpdate = true;
         if (color) color.needsUpdate = true;
@@ -143,7 +173,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
 
         position.needsUpdate = true;
         if (color) color.needsUpdate = true;
-        rec.geometry.computeVertexNormals();
+        refreshNormals(rec, 0, SEG, 0, SEG);
 
         if (rec.physics) rec.physics.syncPhysics(delta);
         return true;
@@ -152,6 +182,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
     function attachChunk(key: string, geometry: THREE.BufferGeometry, originX: number, originZ: number, physics: ChunkPhysicsSync | null = null): void {
         const position = geometry.attributes.position as THREE.BufferAttribute;
         const color = (geometry.attributes.color as THREE.BufferAttribute) || null;
+        const normal = geometry.attributes.normal as THREE.BufferAttribute | undefined;
 
         const baseY = new Float32Array(position.count);
         for (let i = 0; i < position.count; i++) baseY[i] = position.array[i * 3 + 1];
@@ -162,6 +193,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
             color,
             baseY,
             baseColor: color ? new Float32Array(color.array) : null,
+            baseNormal: normal ? new Float32Array(normal.array) : null,
             originX,
             originZ,
             physics

@@ -2,9 +2,9 @@
 // загруженных чанков-диорам. Недостающие строятся по бюджету за кадр,
 // далекие выгружаются вместе с физикой, мешами и реквизитом.
 import * as THREE from 'three';
-import { CHUNK, DIORAMA, PALETTE, PS1_SNAP, WEATHER } from '../config.ts';
+import { CHUNK, DIORAMA, PALETTE, PS1_SNAP } from '../config.ts';
 import { chunkCoordAt, chunkKeyOf } from '../core/chunkCoords.ts';
-import { createSandTexture, createMechTexture } from '../core/textures.ts';
+import { createMechTexture } from '../core/textures.ts';
 import { applyPS1VertexSnap } from '../render/ps1Material.ts';
 import { createChunkProps, type ChunkProps } from './props.ts';
 import { createSandDeformer, type SandDeformer } from './sandDeformation.ts';
@@ -42,15 +42,11 @@ export interface ChunkWorld {
 }
 
 export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorld {
-    // --- Общие ресурсы: материалы и геометрии не зависят от координат чанка ---
-    // Текстура песка общая на все чанки: ветер сдвигает ее целиком,
-    // поэтому рябь бежит по всей пустыне без швов на стыках диорам.
-    const sandTexture = createSandTexture();
-
     const sandMaterial = applyPS1VertexSnap(new THREE.MeshLambertMaterial({
-        map: sandTexture,
         vertexColors: true,
-        flatShading: true
+        // Цвет и детализация рельефа вычисляются в world-space на вершинах,
+        // поэтому на крутых склонах больше нет вытянутой XZ-текстуры.
+        flatShading: false
     }), PS1_SNAP.terrain);
 
     const skirtMaterial = applyPS1VertexSnap(new THREE.MeshLambertMaterial({
@@ -80,8 +76,10 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
         DIORAMA.frameHeight,
         CHUNK.size + 0.8
     );
-    const rockGeometry = new THREE.DodecahedronGeometry(1.0, 0);
+    const rockGeometry = new THREE.DodecahedronGeometry(1.0, 1);
     const debrisGeometry = new THREE.IcosahedronGeometry(1.0, 0);
+    const slabGeometry = new THREE.BoxGeometry(1.6, 0.45, 1.6);
+    const poleGeometry = new THREE.CylinderGeometry(0.06, 0.08, 2.4, 5);
 
     // --- Состояние стриминга ---
     const sandField = createSandField();
@@ -104,7 +102,9 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
             scene, world, cx, cz,
             materials: propMaterials,
             rockGeometry, debrisGeometry,
-            clearZone: { x: focus.x, z: focus.z, radius: CHUNK.propClearRadius }
+            slabGeometry, poleGeometry,
+            clearZone: { x: focus.x, z: focus.z, radius: CHUNK.propClearRadius },
+            enabled: CHUNK.propsEnabled
         });
 
         deformer.attachChunk(key, terrain.sandGeometry, originX, originZ, terrain);
@@ -160,15 +160,11 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
         for (const rec of chunks.values()) rec.props.blastAt(origin, radius, strength);
     }
 
-    // Песок живет во времени: ветер переносит массу между ячейками поля,
-    // гонит рябь по текстуре и толкает обломки. Вызывается в фазе стриминга.
-    // Поле получает время, отработанное физикой, а дрейф текстуры — кадровое:
-    // рябь на песке не обязана совпадать с шагом симуляции.
+    // Песок живет во времени: ветер переносит массу между ячейками поля
+    // и толкает обломки. Вызывается в фазе стриминга.
     function updateSandWeather(dt: number, frameDt: number, weather?: WeatherState | null): void {
         if (!weather) return;
         deformer.update(dt, weather);
-        sandTexture.offset.x -= weather.windX * WEATHER.textureScroll * frameDt;
-        sandTexture.offset.y -= weather.windZ * WEATHER.textureScroll * frameDt;
     }
 
     // focus — позиция меха; budget — сколько чанков достроить в этом кадре;
@@ -241,7 +237,8 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
             frameGeometry.dispose();
             rockGeometry.dispose();
             debrisGeometry.dispose();
-            sandTexture.dispose();
+            slabGeometry.dispose();
+            poleGeometry.dispose();
             sandMaterial.dispose();
             skirtMaterial.dispose();
             frameMaterial.dispose();

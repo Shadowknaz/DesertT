@@ -141,7 +141,9 @@ export async function createDioramaApp(): Promise<DioramaApp> {
     // --- Сцена, камера, рендерер ---
     const scene = new THREE.Scene();
     scene.background = new THREE.Color(PALETTE.background);
-    scene.fog = new THREE.FogExp2(PALETTE.fog, 0.012);
+    // Загруженные чанки заканчиваются раньше дальнего clip plane; плотнее
+    // затухающая дымка скрывает вертикальный срез внешнего кольца.
+    scene.fog = new THREE.FogExp2(PALETTE.fog, 0.020);
 
     const camera = new THREE.PerspectiveCamera(RENDER.fov, window.innerWidth / window.innerHeight, RENDER.near, RENDER.far);
     // Ниже прежней орбиты: в кадр попадает горизонт и полоса неба над ним
@@ -428,6 +430,15 @@ export async function createDioramaApp(): Promise<DioramaApp> {
             : activePose;
         cameraDirector.follow(frameDt, visualPose.position, camConfig.focusHeight, camConfig.followGain);
         cameraDirector.keepAboveGround(camConfig.groundClearance);
+        // Небольшая высотная составляющая к экспоненциальному туману: с
+        // подъёмом камеры дальние хребты читаются отдельными планами, а у
+        // земли сохраняется плотная песчаная дымка. Погода задаёт базовую
+        // плотность, здесь меняется только её видимая высотная часть.
+        if (scene.fog instanceof THREE.FogExp2) {
+            const viewHeight = Math.max(0.0, camera.position.y - visualPose.position.y);
+            const heightMix = THREE.MathUtils.clamp(viewHeight / 18.0, 0.0, 1.0);
+            scene.fog.density *= THREE.MathUtils.lerp(1.04, 0.88, heightMix);
+        }
         lighting.update(visualPose.position, dayState, weatherState);
         sky.update(frameDt, camera, dayState, weatherState);
         const actorDebug = debugEnabled
