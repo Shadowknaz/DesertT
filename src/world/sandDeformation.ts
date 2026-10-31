@@ -1,7 +1,7 @@
 // Песок: слой визуализации поверх активного поля.
 // Переписывает вершины меша (включая частичные dirty-подобласти),
-// красит воронки, своевременно обновляет физические heightfield Rapier
-// и раздаёт шину событий: отпечаток лапы, удар по песку и клик.
+// красит воронки и обновляет маску разрытого/уплотнённого грунта в aSoilMask.w,
+// своевременно обновляет физические heightfield Rapier.
 import * as THREE from 'three';
 import { CHUNK, SANDFIELD } from '../config.ts';
 import { chunkCoordAt, chunkKeyOf } from '../core/chunkCoords.ts';
@@ -19,6 +19,7 @@ export interface AttachedChunkRecord {
     geometry: THREE.BufferGeometry;
     position: THREE.BufferAttribute;
     color: THREE.BufferAttribute | null;
+    soilMask: THREE.BufferAttribute | null;
     baseY: Float32Array;
     baseColor: Float32Array | null;
     // Нормали аналитического рельефа до локальных деформаций. Они нужны как
@@ -37,7 +38,7 @@ export interface SandDeformerOptions {
 export interface SandDeformer {
     attachChunk(key: string, geometry: THREE.BufferGeometry, originX: number, originZ: number, physics?: ChunkPhysicsSync | null): void;
     detachChunk(key: string): void;
-    stampFootprint(worldPos: THREE.Vector3, radius?: number, depth?: number): number;
+    stampFootprint(worldPos: THREE.Vector3 | { x: number; z: number }, radius?: number, depth?: number): number;
     syncPhysicsAt(x: number, z: number, radius?: number): void;
     sampleDepth(x: number, z: number): number;
     update(dt: number, weather?: { windX: number; windZ: number; erosionRate: number } | null): number;
@@ -46,8 +47,12 @@ export interface SandDeformer {
 }
 
 export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer {
-    // key -> { geometry, position, color, baseY, baseColor, baseNormal, originX, originZ, physics }
+    // key -> { geometry, position, color, soilMask, baseY, baseColor, baseNormal, originX, originZ, physics }
     const attached = new Map<string, AttachedChunkRecord>();
+
+    const _normalOut = new THREE.Vector3();
+    const _baseNormal = { x: 0, y: 1, z: 0 };
+    const _weatherEnv = { windX: 0, windZ: 0, erosionRate: 0 };
 
     // Пересчитывает нормали в мировых координатах. `sampleNormal` берёт
     // градиент деформации по обе стороны точки и тем самым корректно
@@ -64,20 +69,20 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
         const baseNormal = rec.baseNormal;
         if (!normal || !baseNormal) return;
 
-        const out = new THREE.Vector3();
+        const hasSampleNormal = typeof field.sampleNormal === 'function';
         for (let r = minRow; r <= maxRow; r++) {
+            const rowOffset = r * N;
             for (let c = minCol; c <= maxCol; c++) {
-                const i = r * N + c;
-                const base = {
-                    x: baseNormal[i * 3],
-                    y: baseNormal[i * 3 + 1],
-                    z: baseNormal[i * 3 + 2]
-                };
+                const i = rowOffset + c;
+                const i3 = i * 3;
+                _baseNormal.x = baseNormal[i3];
+                _baseNormal.y = baseNormal[i3 + 1];
+                _baseNormal.z = baseNormal[i3 + 2];
                 const worldX = rec.originX + rec.position.getX(i);
                 const worldZ = rec.originZ + rec.position.getZ(i);
-                if (typeof field.sampleNormal === 'function') {
-                    field.sampleNormal(worldX, worldZ, base, out);
-                    normal.setXYZ(i, out.x, out.y, out.z);
+                if (hasSampleNormal) {
+                    field.sampleNormal(worldX, worldZ, _baseNormal, _normalOut);
+                    normal.setXYZ(i, _normalOut.x, _normalOut.y, _normalOut.z);
                 } else {
                     // Совместимость с минимальными тестовыми полями без
                     // sampleNormal: внутри чанка сохраняем старый fallback.
@@ -85,8 +90,8 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
                     const cR = Math.min(SEG, c + 1);
                     const rD = Math.max(0, r - 1);
                     const rU = Math.min(SEG, r + 1);
-                    const yL = rec.position.getY(r * N + cL);
-                    const yR = rec.position.getY(r * N + cR);
+                    const yL = rec.position.getY(rowOffset + cL);
+                    const yR = rec.position.getY(rowOffset + cR);
                     const yD = rec.position.getY(rD * N + c);
                     const yU = rec.position.getY(rU * N + c);
                     const dx = (yR - yL) / ((cR - cL) * CELL || 1);
@@ -102,6 +107,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
     function flushRegion(rec: AttachedChunkRecord, grid: any, bounds: { minRow: number; maxRow: number; minCol: number; maxCol: number }): void {
         const position = rec.position;
         const color = rec.color;
+        const soilMask = rec.soilMask;
         const baseColor = rec.baseColor;
         const baseY = rec.baseY;
         const delta = grid.delta;
@@ -120,10 +126,18 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
                 const d = delta[i];
                 position.setY(i, baseY[i] + d);
 
+                const packVal = packing ? packing[i] : 0;
+                const shearMag = slipX ? Math.hypot(slipX[i], slipZ[i]) : 0;
+
+                if (soilMask) {
+                    const disturb = Math.min(1.0, Math.abs(d) * 3.2 + packVal * 1.35 + shearMag * 0.18);
+                    soilMask.setW(i, disturb);
+                }
+
                 if (color && baseColor) {
-                    const shade = Math.min(0.4, Math.max(-0.45, d * SANDFIELD.colorGain));
-                    const pack = packing ? packing[i] * 0.05 : 0;
-                    const shear = slipX ? Math.min(0.08, Math.hypot(slipX[i], slipZ[i]) * 0.06) : 0;
+                    const shade = Math.min(0.45, Math.max(-0.50, d * SANDFIELD.colorGain));
+                    const pack = packVal * 0.08;
+                    const shear = Math.min(0.10, shearMag * 0.07);
                     const k = 1 + shade - pack + shear;
                     color.setXYZ(i, baseColor[i * 3] * k, baseColor[i * 3 + 1] * k, baseColor[i * 3 + 2] * k);
                 }
@@ -134,6 +148,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
 
         position.needsUpdate = true;
         if (color) color.needsUpdate = true;
+        if (soilMask) soilMask.needsUpdate = true;
         if (rec.physics) rec.physics.syncPhysics(delta);
     }
 
@@ -144,6 +159,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
         const grid = field.getRecord(key);
         const position = rec.position;
         const color = rec.color;
+        const soilMask = rec.soilMask;
         const baseColor = rec.baseColor;
         const baseY = rec.baseY;
         const delta = grid ? grid.delta : null;
@@ -162,10 +178,18 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
             const d = delta[i];
             position.setY(i, baseY[i] + d);
 
+            const packVal = packing ? packing[i] : 0;
+            const shearMag = slipX ? Math.hypot(slipX[i], slipZ[i]) : 0;
+
+            if (soilMask) {
+                const disturb = Math.min(1.0, Math.abs(d) * 3.2 + packVal * 1.35 + shearMag * 0.18);
+                soilMask.setW(i, disturb);
+            }
+
             if (color && baseColor) {
-                const shade = Math.min(0.4, Math.max(-0.45, d * SANDFIELD.colorGain));
-                const pack = packing ? packing[i] * 0.05 : 0;
-                const shear = slipX ? Math.min(0.08, Math.hypot(slipX[i], slipZ[i]) * 0.06) : 0;
+                const shade = Math.min(0.45, Math.max(-0.50, d * SANDFIELD.colorGain));
+                const pack = packVal * 0.08;
+                const shear = Math.min(0.10, shearMag * 0.07);
                 const k = 1 + shade - pack + shear;
                 color.setXYZ(i, baseColor[i * 3] * k, baseColor[i * 3 + 1] * k, baseColor[i * 3 + 2] * k);
             }
@@ -173,6 +197,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
 
         position.needsUpdate = true;
         if (color) color.needsUpdate = true;
+        if (soilMask) soilMask.needsUpdate = true;
         refreshNormals(rec, 0, SEG, 0, SEG);
 
         if (rec.physics) rec.physics.syncPhysics(delta);
@@ -182,6 +207,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
     function attachChunk(key: string, geometry: THREE.BufferGeometry, originX: number, originZ: number, physics: ChunkPhysicsSync | null = null): void {
         const position = geometry.attributes.position as THREE.BufferAttribute;
         const color = (geometry.attributes.color as THREE.BufferAttribute) || null;
+        const soilMask = (geometry.attributes.aSoilMask as THREE.BufferAttribute) || null;
         const normal = geometry.attributes.normal as THREE.BufferAttribute | undefined;
 
         const baseY = new Float32Array(position.count);
@@ -191,6 +217,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
             geometry,
             position,
             color,
+            soilMask,
             baseY,
             baseColor: color ? new Float32Array(color.array) : null,
             baseNormal: normal ? new Float32Array(normal.array) : null,
@@ -223,7 +250,7 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
         );
     }
 
-    function stampFootprint(worldPos: THREE.Vector3, radius: number = 1.05, depth: number = 0.24): number {
+    function stampFootprint(worldPos: THREE.Vector3 | { x: number; z: number }, radius: number = 1.05, depth: number = 0.24): number {
         const displaced = field.stampCrater(
             worldPos.x, worldPos.z, radius, depth, DEFAULT_PACKING
         );
@@ -254,13 +281,15 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
 
     function update(dt: number, weather: { windX: number; windZ: number; erosionRate: number } | null = null): number {
         if (weather) {
-            field.update(dt, {
-                windX: weather.windX,
-                windZ: weather.windZ,
-                erosionRate: weather.erosionRate
-            });
+            _weatherEnv.windX = weather.windX;
+            _weatherEnv.windZ = weather.windZ;
+            _weatherEnv.erosionRate = weather.erosionRate;
+            field.update(dt, _weatherEnv);
         } else {
-            field.update(dt, { erosionRate: 0 });
+            _weatherEnv.windX = 0;
+            _weatherEnv.windZ = 0;
+            _weatherEnv.erosionRate = 0;
+            field.update(dt, _weatherEnv);
         }
 
         // Своевременно обновляем физические коллайдеры Rapier для всех изменённых ветром чанков
@@ -299,4 +328,3 @@ export function createSandDeformer({ field }: SandDeformerOptions): SandDeformer
         dispose
     };
 }
-

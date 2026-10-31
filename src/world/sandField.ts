@@ -54,6 +54,10 @@ const statePack = new Float32Array(CELLS);
 const flowMass = new Float32Array(CELLS);
 const flowPack = new Float32Array(CELLS);
 
+// Смещения 8 соседей для безмусорного обхода в withdrawMass / depositMass
+const NB_DC = [1, -1, 0, 0, 1, -1, 1, -1];
+const NB_DR = [0, 0, 1, -1, 1, -1, -1, 1];
+
 export interface ChunkRecordInternal {
     key: string;
     cx: number;
@@ -1320,20 +1324,18 @@ export function createSandField() {
 
         let needed = amount - takenVol;
         if (needed > 1e-6) {
-            const neighbors = [
-                { c: c + 1, r }, { c: c - 1, r }, { c, r: r + 1 }, { c, r: r - 1 },
-                { c: c + 1, r: r + 1 }, { c: c - 1, r: r - 1 }, { c: c + 1, r: r - 1 }, { c: c - 1, r: r + 1 }
-            ];
-            for (const nb of neighbors) {
-                if (nb.c >= 0 && nb.c <= SEG && nb.r >= 0 && nb.r <= SEG) {
-                    const nIdx = nb.r * N + nb.c;
+            for (let k = 0; k < 8; k++) {
+                const nc = c + NB_DC[k];
+                const nr = r + NB_DR[k];
+                if (nc >= 0 && nc <= SEG && nr >= 0 && nr <= SEG) {
+                    const nIdx = nr * N + nc;
                     const nAvailH = Math.max(0, rec.delta[nIdx] - (-SANDFIELD.maxSinkDepth));
                     const nAvailV = nAvailH * cellArea;
                     if (nAvailV > 1e-6) {
                         const take = Math.min(nAvailV, needed);
                         rec.delta[nIdx] -= take / cellArea;
                         rec.touched = true;
-                        expandDirtyBox(rec, nb.c, nb.c, nb.r, nb.r);
+                        expandDirtyBox(rec, nc, nc, nr, nr);
                         markHeight(rec);
                         takenVol += take;
                         needed -= take;
@@ -1382,20 +1384,18 @@ export function createSandField() {
         }
 
         let excess = amount - placedVol;
-        const neighbors = [
-            { c: c + 1, r }, { c: c - 1, r }, { c, r: r + 1 }, { c, r: r - 1 },
-            { c: c + 1, r: r + 1 }, { c: c - 1, r: r - 1 }, { c: c + 1, r: r - 1 }, { c: c - 1, r: r + 1 }
-        ];
-        for (const nb of neighbors) {
-            if (nb.c >= 0 && nb.c <= SEG && nb.r >= 0 && nb.r <= SEG) {
-                const nIdx = nb.r * N + nb.c;
+        for (let k = 0; k < 8; k++) {
+            const nc = c + NB_DC[k];
+            const nr = r + NB_DR[k];
+            if (nc >= 0 && nc <= SEG && nr >= 0 && nr <= SEG) {
+                const nIdx = nr * N + nc;
                 const nRoomH = Math.max(0, SANDFIELD.maxDelta - rec.delta[nIdx]);
                 const nRoomV = nRoomH * cellArea;
                 if (nRoomV > 1e-6) {
                     const put = Math.min(nRoomV, excess);
                     rec.delta[nIdx] += put / cellArea;
                     rec.touched = true;
-                    expandDirtyBox(rec, nb.c, nb.c, nb.r, nb.r);
+                    expandDirtyBox(rec, nc, nc, nr, nr);
                     markHeight(rec);
                     placedVol += put;
                     excess -= put;

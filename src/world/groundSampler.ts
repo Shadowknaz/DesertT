@@ -1,11 +1,11 @@
 // Выборка верхнего слоя грунта с поддержкой классификации материалов.
 // Возвращает высоту, нормаль, тип поверхности (sand/solid), классифицированный материал
-// (loose_sand, compacted_sand, dense_layer, stone, bedrock) и террамеханические свойства.
+// (loose_sand, compacted_sand, dense_layer, stone, bedrock), допустимый угол контакта и террамеханические свойства.
 import * as THREE from 'three';
 import { RAPIER } from './physics.ts';
-import { SAND, SANDFIELD, TERRAIN } from '../config.ts';
+import { COSMO, SAND, SANDFIELD, TERRAIN } from '../config.ts';
 import { getDuneHeight, getDuneNormal } from '../core/duneField.ts';
-import { classifySoilMaterial, SOIL_MATERIALS, type SoilMaterial } from './terramechanics.ts';
+import { classifySoilMaterial, SOIL_MATERIALS } from './terramechanics.ts';
 
 export interface GroundSamplerResult {
     y: number;
@@ -19,9 +19,18 @@ export interface GroundSamplerResult {
     cohesion: number;
     frictionAngleDeg: number;
     bearingCapacity: number;
+    maxContactAngle: number;
 }
 
 export type GroundSample = GroundSamplerResult;
+
+export interface CharacterGroundProbes {
+    center: GroundSample;
+    leftFoot: GroundSample;
+    rightFoot: GroundSample;
+    ahead: GroundSample;
+    behind: GroundSample;
+}
 
 export interface GroundSamplerOptions {
     world: RAPIER.World;
@@ -39,11 +48,248 @@ export interface GroundSampler {
     ignoreBody(bodyOrHandle: RAPIER.RigidBody | number | { handle: number } | any): void;
 }
 
-export function copyGroundSample(source: GroundSamplerResult, target: Partial<GroundSamplerResult> & { normal: THREE.Vector3 } = { normal: new THREE.Vector3() }): GroundSamplerResult {
+const DEFAULT_SAND_MAX_ANGLE = 40 * Math.PI / 180;
+const DEFAULT_PACKED_BONUS_RAD = 5 * Math.PI / 180;
+const DEFAULT_SOLID_MAX_ANGLE = COSMO.maxSlopeClimbAngle ?? (45 * Math.PI / 180);
+
+export function computeMaxContactAngle(
+    surfaceType: 'sand' | 'solid' | string,
+    materialId: string,
+    packing: number
+): number {
+    if (surfaceType === 'solid' || materialId === 'stone' || materialId === 'bedrock') {
+        return DEFAULT_SOLID_MAX_ANGLE;
+    }
+    const clampedPacking = THREE.MathUtils.clamp(packing || 0, 0, 1);
+    if (materialId === 'compacted_sand' || materialId === 'dense_layer') {
+        return Math.min(DEFAULT_SOLID_MAX_ANGLE, DEFAULT_SAND_MAX_ANGLE + DEFAULT_PACKED_BONUS_RAD * Math.max(0.5, clampedPacking));
+    }
+    return Math.min(DEFAULT_SOLID_MAX_ANGLE, DEFAULT_SAND_MAX_ANGLE + DEFAULT_PACKED_BONUS_RAD * clampedPacking);
+}
+
+export function createDefaultGroundSample(y = 0): GroundSample {
+    return {
+        y,
+        normal: new THREE.Vector3(0, 1, 0),
+        surfaceType: 'sand',
+        colliderHandle: null,
+        packing: 0,
+        friction: SANDFIELD.gripLoose,
+        sink: 0,
+        materialId: 'loose_sand',
+        cohesion: SOIL_MATERIALS.loose_sand.cohesion,
+        frictionAngleDeg: SOIL_MATERIALS.loose_sand.frictionAngleDeg,
+        bearingCapacity: SOIL_MATERIALS.loose_sand.bearingCapacityBase,
+        maxContactAngle: computeMaxContactAngle('sand', 'loose_sand', 0)
+    };
+}
+
+export function copyGroundSample(
+    source: GroundSamplerResult,
+    target: Partial<GroundSamplerResult> & { normal: THREE.Vector3 } = { normal: new THREE.Vector3() }
+): GroundSamplerResult {
     const normal = target.normal;
     Object.assign(target, source);
     target.normal = normal.copy(source.normal);
+    if (typeof target.maxContactAngle !== 'number') {
+        target.maxContactAngle = computeMaxContactAngle(
+            target.surfaceType || 'sand',
+            target.materialId || 'loose_sand',
+            target.packing ?? 0
+        );
+    }
     return target as GroundSamplerResult;
+}
+
+function rawHeightFromQuery(groundAt: any, x: number, z: number, fallbackY = 0): number {
+    if (typeof groundAt !== 'function') return fallbackY;
+    const s = groundAt(x, z);
+    if (typeof s === 'number') return Number.isFinite(s) ? s : fallbackY;
+    if (s && typeof s.y === 'number' && Number.isFinite(s.y)) return s.y;
+    return fallbackY;
+}
+
+/**
+ * Приводит любой результат groundAt (полный GroundSample, частичный объект или число высоты)
+ * к единому валидному GroundSample с нормалью, трением, уплотнением, осадкой и допустимым углом контакта.
+ */
+export function resolveGroundSample(
+    groundAt: any,
+    x: number,
+    z: number,
+    out: GroundSample = createDefaultGroundSample(),
+    computeMissingNormal = true
+): GroundSample {
+    if (typeof groundAt !== 'function') {
+        out.y = 0;
+        out.normal.set(0, 1, 0);
+        out.surfaceType = 'sand';
+        out.colliderHandle = null;
+        out.packing = 0;
+        out.friction = SANDFIELD.gripLoose;
+        out.sink = 0;
+        out.materialId = 'loose_sand';
+        out.cohesion = SOIL_MATERIALS.loose_sand.cohesion;
+        out.frictionAngleDeg = SOIL_MATERIALS.loose_sand.frictionAngleDeg;
+        out.bearingCapacity = SOIL_MATERIALS.loose_sand.bearingCapacityBase;
+        out.maxContactAngle = computeMaxContactAngle('sand', 'loose_sand', 0);
+        return out;
+    }
+
+    const raw = groundAt(x, z);
+    if (typeof raw === 'number') {
+        out.y = Number.isFinite(raw) ? raw : 0;
+        out.surfaceType = 'sand';
+        out.colliderHandle = null;
+        out.packing = 0;
+        out.friction = SANDFIELD.gripLoose;
+        out.sink = 0;
+        out.materialId = 'loose_sand';
+        out.cohesion = SOIL_MATERIALS.loose_sand.cohesion;
+        out.frictionAngleDeg = SOIL_MATERIALS.loose_sand.frictionAngleDeg;
+        out.bearingCapacity = SOIL_MATERIALS.loose_sand.bearingCapacityBase;
+        out.maxContactAngle = computeMaxContactAngle('sand', 'loose_sand', 0);
+        if (computeMissingNormal) {
+            const eps = 0.30;
+            const hXP = rawHeightFromQuery(groundAt, x + eps, z, out.y);
+            const hXN = rawHeightFromQuery(groundAt, x - eps, z, out.y);
+            const hZP = rawHeightFromQuery(groundAt, x, z + eps, out.y);
+            const hZN = rawHeightFromQuery(groundAt, x, z - eps, out.y);
+            const nx = (hXN - hXP) / (2 * eps);
+            const nz = (hZN - hZP) / (2 * eps);
+            out.normal.set(nx, 1.0, nz).normalize();
+        } else {
+            out.normal.set(0, 1, 0);
+        }
+        return out;
+    }
+
+    if (raw && typeof raw.y === 'number') {
+        out.y = Number.isFinite(raw.y) ? raw.y : 0;
+        const surfaceType: 'sand' | 'solid' = raw.surfaceType === 'solid' ? 'solid' : 'sand';
+        out.surfaceType = surfaceType;
+        out.colliderHandle = raw.colliderHandle ?? null;
+        out.packing = typeof raw.packing === 'number' && Number.isFinite(raw.packing)
+            ? THREE.MathUtils.clamp(raw.packing, 0, 1)
+            : 0;
+        out.sink = typeof raw.sink === 'number' && Number.isFinite(raw.sink)
+            ? Math.max(0, raw.sink)
+            : 0;
+        out.materialId = raw.materialId || (surfaceType === 'solid' ? 'stone' : 'loose_sand');
+        const matDef = (SOIL_MATERIALS as any)[out.materialId] || (surfaceType === 'solid' ? SOIL_MATERIALS.stone : SOIL_MATERIALS.loose_sand);
+        out.friction = typeof raw.friction === 'number' && Number.isFinite(raw.friction)
+            ? raw.friction
+            : (surfaceType === 'solid'
+                ? 0.9
+                : SANDFIELD.gripLoose + (SANDFIELD.gripPacked - SANDFIELD.gripLoose) * out.packing);
+        out.cohesion = typeof raw.cohesion === 'number' ? raw.cohesion : matDef.cohesion;
+        out.frictionAngleDeg = typeof raw.frictionAngleDeg === 'number' ? raw.frictionAngleDeg : matDef.frictionAngleDeg;
+        out.bearingCapacity = typeof raw.bearingCapacity === 'number' ? raw.bearingCapacity : matDef.bearingCapacityBase;
+        out.maxContactAngle = typeof raw.maxContactAngle === 'number' && Number.isFinite(raw.maxContactAngle)
+            ? raw.maxContactAngle
+            : computeMaxContactAngle(surfaceType, out.materialId, out.packing);
+
+        if (raw.normal && typeof raw.normal.x === 'number' && Number.isFinite(raw.normal.x) && Number.isFinite(raw.normal.y) && Number.isFinite(raw.normal.z)) {
+            out.normal.set(raw.normal.x, Math.max(0.05, raw.normal.y), raw.normal.z);
+            if (out.normal.lengthSq() > 1e-6) {
+                out.normal.normalize();
+            } else {
+                out.normal.set(0, 1, 0);
+            }
+        } else if (computeMissingNormal) {
+            const eps = 0.30;
+            const hXP = rawHeightFromQuery(groundAt, x + eps, z, out.y);
+            const hXN = rawHeightFromQuery(groundAt, x - eps, z, out.y);
+            const hZP = rawHeightFromQuery(groundAt, x, z + eps, out.y);
+            const hZN = rawHeightFromQuery(groundAt, x, z - eps, out.y);
+            const nx = (hXN - hXP) / (2 * eps);
+            const nz = (hZN - hZP) / (2 * eps);
+            out.normal.set(nx, 1.0, nz).normalize();
+        } else {
+            out.normal.set(0, 1, 0);
+        }
+        return out;
+    }
+
+    out.y = 0;
+    out.normal.set(0, 1, 0);
+    out.surfaceType = 'sand';
+    out.colliderHandle = null;
+    out.packing = 0;
+    out.friction = SANDFIELD.gripLoose;
+    out.sink = 0;
+    out.materialId = 'loose_sand';
+    out.cohesion = SOIL_MATERIALS.loose_sand.cohesion;
+    out.frictionAngleDeg = SOIL_MATERIALS.loose_sand.frictionAngleDeg;
+    out.bearingCapacity = SOIL_MATERIALS.loose_sand.bearingCapacityBase;
+    out.maxContactAngle = computeMaxContactAngle('sand', 'loose_sand', 0);
+    return out;
+}
+
+export function createCharacterGroundProbes(): CharacterGroundProbes {
+    return {
+        center: createDefaultGroundSample(),
+        leftFoot: createDefaultGroundSample(),
+        rightFoot: createDefaultGroundSample(),
+        ahead: createDefaultGroundSample(),
+        behind: createDefaultGroundSample()
+    };
+}
+
+/**
+ * Сэмплирует 5 опорных точек поверхности вокруг персонажа:
+ * - под центром капсулы (center)
+ * - под левой стопой (leftFoot)
+ * - под правой стопой (rightFoot)
+ * - впереди по курсу/движению (ahead)
+ * - позади для оценки спуска и перехода через гребень (behind)
+ */
+export function sampleCharacterGroundProbes(
+    groundAt: any,
+    x: number,
+    z: number,
+    dirX: number,
+    dirZ: number,
+    rightX: number,
+    rightZ: number,
+    config: Partial<typeof COSMO> = COSMO,
+    out: CharacterGroundProbes = createCharacterGroundProbes()
+): CharacterGroundProbes {
+    const footOffset = config.probeFootOffsetX ?? COSMO.probeFootOffsetX ?? 0.19;
+    const aheadDist = config.probeAheadDistance ?? COSMO.probeAheadDistance ?? 0.42;
+    const behindDist = config.probeBehindDistance ?? COSMO.probeBehindDistance ?? 0.36;
+
+    resolveGroundSample(groundAt, x, z, out.center, true);
+    resolveGroundSample(
+        groundAt,
+        x - rightX * footOffset,
+        z - rightZ * footOffset,
+        out.leftFoot,
+        true
+    );
+    resolveGroundSample(
+        groundAt,
+        x + rightX * footOffset,
+        z + rightZ * footOffset,
+        out.rightFoot,
+        true
+    );
+    resolveGroundSample(
+        groundAt,
+        x + dirX * aheadDist,
+        z + dirZ * aheadDist,
+        out.ahead,
+        false
+    );
+    resolveGroundSample(
+        groundAt,
+        x - dirX * behindDist,
+        z - dirZ * behindDist,
+        out.behind,
+        false
+    );
+
+    return out;
 }
 
 export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, sandField = null }: GroundSamplerOptions): GroundSampler {
@@ -55,7 +301,8 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
         materialId: 'loose_sand',
         cohesion: SOIL_MATERIALS.loose_sand.cohesion,
         frictionAngleDeg: SOIL_MATERIALS.loose_sand.frictionAngleDeg,
-        bearingCapacity: SOIL_MATERIALS.loose_sand.bearingCapacityBase
+        bearingCapacity: SOIL_MATERIALS.loose_sand.bearingCapacityBase,
+        maxContactAngle: computeMaxContactAngle('sand', 'loose_sand', 0)
     };
     const baseNormal = new THREE.Vector3(0, 1, 0);
 
@@ -79,7 +326,7 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
             + (SANDFIELD.gripPacked - SANDFIELD.gripLoose) * result.packing;
         result.sink = Math.max(0, -delta);
 
-        baseNormal.copy(getDuneNormal(x, z));
+        getDuneNormal(x, z, 0.35, baseNormal);
         if (deform && sandField) sandField.sampleNormal(x, z, baseNormal, result.normal);
         else result.normal.copy(baseNormal);
 
@@ -90,6 +337,7 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
         result.cohesion = mat.cohesion;
         result.frictionAngleDeg = mat.frictionAngleDeg;
         result.bearingCapacity = mat.bearingCapacityBase;
+        result.maxContactAngle = computeMaxContactAngle('sand', result.materialId, result.packing);
 
         return result;
     }
@@ -129,6 +377,7 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
             result.cohesion = SOIL_MATERIALS.stone.cohesion;
             result.frictionAngleDeg = SOIL_MATERIALS.stone.frictionAngleDeg;
             result.bearingCapacity = SOIL_MATERIALS.stone.bearingCapacityBase;
+            result.maxContactAngle = computeMaxContactAngle('solid', 'stone', 0);
 
             baseNormal.set(hit.normal.x, hit.normal.y, hit.normal.z);
             if (baseNormal.y < 0.5) baseNormal.set(0, 1, 0);

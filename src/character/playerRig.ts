@@ -31,6 +31,7 @@ export interface PlayerRig {
     applyMovement(movement: { x: number; y: number; z: number }): void;
     getFeetPosition(): { x: number; y: number; z: number };
     setFeetPosition(x: number, y: number, z: number): void;
+    sampleWorldGround?(x: number, z: number): { y: number; normal: THREE.Vector3; surfaceType: 'sand' | 'solid'; materialId: string } | null;
     isGrounded(): boolean;
     numCollisions(): number;
     getCollision(idx: number): any;
@@ -77,9 +78,11 @@ export function createPlayerRig({
     const characterController = world.createCharacterController(0.04);
     characterController.setUp({ x: 0.0, y: 1.0, z: 0.0 });
     characterController.setSlideEnabled(true);
-    characterController.setMaxSlopeClimbAngle(config.maxSlopeClimbAngle ?? (50 * Math.PI / 180));
-    characterController.setMinSlopeSlideAngle(config.minSlopeSlideAngle ?? (32 * Math.PI / 180));
-    if (config.enableAutostep) {
+    // Устанавливаем запас по углу граней heightfield для KCC (58°/55°), чтобы микро-валики отпечатков
+    // на склонах 30°–40° не вызывали заклинивание коллайдера (макро-уклон контролируется в playerController).
+    characterController.setMaxSlopeClimbAngle(Math.max(config.maxSlopeClimbAngle ?? 0, 58 * Math.PI / 180));
+    characterController.setMinSlopeSlideAngle(Math.max(config.minSlopeSlideAngle ?? 0, 55 * Math.PI / 180));
+    if ((config.enableAutostep as boolean | undefined) !== false) {
         characterController.enableAutostep(
             config.autostepMaxHeight ?? 0.25,
             config.autostepMinWidth ?? 0.20,
@@ -92,6 +95,7 @@ export function createPlayerRig({
 
     let disposed = false;
     let isGroundedCache = false;
+    const probeRay = new RAPIER.Ray({ x: 0, y: 80, z: 0 }, { x: 0, y: -1, z: 0 });
 
     /**
      * Вычисляет допустимое физическое перемещение капсулы с учетом препятствий и склонов.
@@ -145,11 +149,58 @@ export function createPlayerRig({
      */
     function setFeetPosition(x: number, y: number, z: number): void {
         if (disposed) return;
-        body.setTranslation({
+        const nextTra = {
             x,
             y: y + capsuleOffsetY,
             z
-        }, true);
+        };
+        body.setNextKinematicTranslation(nextTra);
+        body.setTranslation(nextTra, true);
+    }
+
+    /**
+     * Выполняет вертикальный луч в физическом мире Rapier (игнорируя собственную капсулу персонажа)
+     * для согласования высоты и нормали рельефа, когда внешний groundSampler не передан.
+     */
+    function sampleWorldGround(x: number, z: number): { y: number; normal: THREE.Vector3; surfaceType: 'sand' | 'solid'; materialId: string } | null {
+        if (disposed || !world || typeof world.castRayAndGetNormal !== 'function') return null;
+        const currentFeetY = getFeetPosition().y;
+        probeRay.origin.x = x;
+        probeRay.origin.y = currentFeetY + 25.0;
+        probeRay.origin.z = z;
+
+        const hit = world.castRayAndGetNormal(
+            probeRay,
+            60.0,
+            true,
+            undefined,
+            undefined,
+            undefined,
+            body,
+            (col: any) => {
+                if (!col || col.handle === collider.handle) return false;
+                const parent = col.parent?.();
+                if (parent && parent.handle === body.handle) return false;
+                if (col.shape?.type === RAPIER.ShapeType.Capsule) return false;
+                return true;
+            }
+        );
+
+        if (!hit || hit.toi <= 0.01) return null;
+        const hitY = probeRay.origin.y - hit.toi;
+        const isHeightField = hit.collider?.shape?.type === RAPIER.ShapeType.HeightField;
+        const normal = new THREE.Vector3(
+            hit.normal?.x ?? 0,
+            Math.max(0.05, hit.normal?.y ?? 1),
+            hit.normal?.z ?? 0
+        ).normalize();
+
+        return {
+            y: hitY,
+            normal,
+            surfaceType: isHeightField ? 'sand' : 'solid',
+            materialId: isHeightField ? 'loose_sand' : 'stone'
+        };
     }
 
     /**
@@ -178,6 +229,7 @@ export function createPlayerRig({
         applyMovement,
         getFeetPosition,
         setFeetPosition,
+        sampleWorldGround,
         isGrounded: () => isGroundedCache,
         numCollisions: () => (disposed ? 0 : characterController.numComputedCollisions()),
         getCollision: (idx: number) => (disposed ? null : characterController.computedCollision(idx)),

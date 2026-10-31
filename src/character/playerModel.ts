@@ -1,9 +1,16 @@
 import * as THREE from 'three';
+import { COSMO } from '../config.ts';
+import {
+    createDefaultGroundSample,
+    resolveGroundSample,
+    type GroundSample
+} from '../world/groundSampler.ts';
 
 // Процедурный двуногий риг из бывшего standalone player.html.
 // Сцена и жизненный цикл рендера принадлежат основному приложению.
 export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; scale?: number } = {} as any) {
-    if (!scene) throw new Error('Player model requires a Three.js scene');  // 2. ПРОЦЕДУРНЫЕ LOW-RES ТЕКСТУРЫ В СТИЛЕ PS1 (С ДИЗЕРИНГОМ BAYER 4x4)
+    if (!scene) throw new Error('Player model requires a Three.js scene');
+  // 2. ПРОЦЕДУРНЫЕ LOW-RES ТЕКСТУРЫ В СТИЛЕ PS1 (С ДИЗЕРИНГОМ BAYER 4x4)
   // ============================================================================
   const bayer4x4 = [
     [ 0,  8,  2, 10],
@@ -258,7 +265,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
   }
 
   const _vPistonDir = new THREE.Vector3();
-  const _vPistonUp = new THREE.Vector3();
+  const _vPistonUp = new THREE.Vector3(0, 1, 0);
   const _vPistonRight = new THREE.Vector3();
   const _vPistonOrthoUp = new THREE.Vector3();
   const _vPistonLateral = new THREE.Vector3(1, 0, 0);
@@ -278,7 +285,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     // без пороговых переключений и скачков на 90 градусов.
     _vPistonRight.crossVectors(_vPistonLateral, _vPistonDir);
     if (_vPistonRight.lengthSq() < 0.0001) {
-      _vPistonRight.set(0, 1, 0).crossVectors(new THREE.Vector3(0, 1, 0), _vPistonDir);
+      _vPistonRight.crossVectors(_vPistonUp, _vPistonDir);
     }
     _vPistonRight.normalize();
     _vPistonOrthoUp.crossVectors(_vPistonDir, _vPistonRight).normalize();
@@ -681,7 +688,15 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
   const _mBasis = new THREE.Matrix4();
   const _plateQuat = new THREE.Quaternion();
   const _yawQuat = new THREE.Quaternion();
+  const _targetFootQuat = new THREE.Quaternion();
   const _euler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+  function sanitizeVector3(v: THREE.Vector3, fallbackX = 0, fallbackY = 0, fallbackZ = 0): THREE.Vector3 {
+    if (!Number.isFinite(v.x) || !Number.isFinite(v.y) || !Number.isFinite(v.z)) {
+      v.set(fallbackX, fallbackY, fallbackZ);
+    }
+    return v;
+  }
 
   function solveTwoBoneIK(
     rootWorldPos: THREE.Vector3,
@@ -690,8 +705,13 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     len1: number,
     len2: number,
     bone1Group: THREE.Object3D,
-    bone2Group: THREE.Object3D
+    bone2Group: THREE.Object3D,
+    fallbackOrthoAxis?: THREE.Vector3
   ): void {
+    sanitizeVector3(rootWorldPos, 0, 0.8, 0);
+    sanitizeVector3(targetWorldPos, rootWorldPos.x, 0, rootWorldPos.z);
+    sanitizeVector3(poleDirectionWorld, 0, 0, 1);
+
     _vDir.subVectors(targetWorldPos, rootWorldPos);
     const rawDist = _vDir.length();
     const minDist = Math.abs(len1 - len2) + 0.02;
@@ -701,7 +721,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     // исключает жесткий удар колена о предел 180° ("коленный стук / knee pop")
     const softThreshold = 0.04;
     const d0 = maxReach - softThreshold;
-    let clampedDist;
+    let clampedDist: number;
     if (rawDist > d0) {
       clampedDist = maxReach - softThreshold * Math.exp(-(rawDist - d0) / softThreshold);
     } else {
@@ -721,10 +741,27 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     );
     const sinAngle1 = Math.sqrt(Math.max(0.0, 1.0 - cosAngle1 * cosAngle1));
 
-    _vPole.copy(poleDirectionWorld).normalize();
+    _vPole.copy(poleDirectionWorld);
+    if (_vPole.lengthSq() > 1e-6) {
+      _vPole.normalize();
+    } else {
+      _vPole.set(0, 0, 1);
+    }
+
     _vOrtho.crossVectors(_vDir, _vPole);
     if (_vOrtho.lengthSq() < 0.0001) {
-      _vOrtho.set(1, 0, 0);
+      if (fallbackOrthoAxis && fallbackOrthoAxis.lengthSq() > 1e-4) {
+        _vOrtho.copy(fallbackOrthoAxis).normalize();
+      } else {
+        _vOrtho.set(1, 0, 0);
+      }
+      // Гарантируем ортогональность к _vDir
+      _vOrtho.addScaledVector(_vDir, -_vOrtho.dot(_vDir));
+      if (_vOrtho.lengthSq() < 0.0001) {
+        _vOrtho.set(1, 0, 0);
+      } else {
+        _vOrtho.normalize();
+      }
     } else {
       _vOrtho.normalize();
     }
@@ -738,8 +775,12 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     _vX.copy(_vOrtho).negate();
 
     // Кость 1: от root к mid
-    _vZ.subVectors(_vMid, rootWorldPos).normalize();
-    _vY.crossVectors(_vZ, _vX).normalize();
+    _vZ.subVectors(_vMid, rootWorldPos);
+    if (_vZ.lengthSq() > 1e-6) _vZ.normalize();
+    else _vZ.set(0, -1, 0);
+    _vY.crossVectors(_vZ, _vX);
+    if (_vY.lengthSq() > 1e-6) _vY.normalize();
+    else _vY.set(0, 0, 1);
     _mBasis.makeBasis(_vX, _vY, _vZ);
     bone1Group.position.copy(rootWorldPos);
     bone1Group.quaternion.setFromRotationMatrix(_mBasis);
@@ -749,8 +790,12 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     _vEffectiveTarget.copy(rootWorldPos).addScaledVector(_vDir, clampedDist);
 
     // Кость 2: от mid к effectiveTarget
-    _vZ.subVectors(_vEffectiveTarget, _vMid).normalize();
-    _vY.crossVectors(_vZ, _vX).normalize();
+    _vZ.subVectors(_vEffectiveTarget, _vMid);
+    if (_vZ.lengthSq() > 1e-6) _vZ.normalize();
+    else _vZ.set(0, -1, 0);
+    _vY.crossVectors(_vZ, _vX);
+    if (_vY.lengthSq() > 1e-6) _vY.normalize();
+    else _vY.set(0, 0, 1);
     _mBasis.makeBasis(_vX, _vY, _vZ);
     bone2Group.position.copy(_vMid);
     bone2Group.quaternion.setFromRotationMatrix(_mBasis);
@@ -766,8 +811,16 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
   const _legPoleWorld = new THREE.Vector3();
   const _armPoleWorld = new THREE.Vector3();
   const _ankleWorldTarget = new THREE.Vector3();
+  const _scratchGroundSample = createDefaultGroundSample();
+  const _midGroundSample = createDefaultGroundSample();
+  const _candGroundSample = createDefaultGroundSample();
 
   let smoothPelvisDrop = 0;
+  let smoothSupportPitch = 0;
+  let smoothSupportRoll = 0;
+  let smoothComShiftX = 0;
+  let smoothAccelPitch = 0;
+  let smoothCrossSlopeRoll = 0;
 
   // Переменные рэгдолл-инерции и плавного вторичного движения (Secondary Motion)
   let smoothBobY = 0;
@@ -786,10 +839,167 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
 
   const _smoothLeftFootNormal = new THREE.Vector3(0, 1, 0);
   const _smoothRightFootNormal = new THREE.Vector3(0, 1, 0);
+  const _smoothLeftFootQuat = new THREE.Quaternion();
+  const _smoothRightFootQuat = new THREE.Quaternion();
+  let footQuatsInitialized = false;
 
   const _smoothLeftHandPos = new THREE.Vector3();
   const _smoothRightHandPos = new THREE.Vector3();
   let handPositionsInitialized = false;
+
+  // Состояние фиксации опорной стопы (Stance Foot World-Space Lock) и траектории маха
+  interface FootGaitMemory {
+    wasInStance: boolean;
+    lockedWorldPos: THREE.Vector3;
+    liftoffWorldPos: THREE.Vector3;
+    liftoffGroundY: number;
+    prevPhi: number;
+  }
+  const leftFootMem: FootGaitMemory = {
+    wasInStance: false,
+    lockedWorldPos: new THREE.Vector3(-0.19, 0, 0),
+    liftoffWorldPos: new THREE.Vector3(-0.19, 0, 0),
+    liftoffGroundY: 0,
+    prevPhi: -1
+  };
+  const rightFootMem: FootGaitMemory = {
+    wasInStance: false,
+    lockedWorldPos: new THREE.Vector3(0.19, 0, 0),
+    liftoffWorldPos: new THREE.Vector3(0.19, 0, 0),
+    liftoffGroundY: 0,
+    prevPhi: -1
+  };
+  const _prevRootPos = new THREE.Vector3(0, 0, 0);
+  let hasPrevRootPos = false;
+
+  function queryFootGround(
+    groundAt: any,
+    x: number,
+    z: number,
+    fallbackY: number,
+    outSample: GroundSample
+  ): { sample: GroundSample; rawNormalRef: THREE.Vector3 | null } {
+    if (typeof groundAt !== 'function') {
+      outSample.y = fallbackY;
+      outSample.normal.set(0, 1, 0);
+      outSample.surfaceType = 'sand';
+      outSample.materialId = 'loose_sand';
+      outSample.packing = 0;
+      outSample.sink = 0;
+      outSample.friction = 0.5;
+      outSample.maxContactAngle = COSMO.maxSlopeClimbAngle ?? (45 * Math.PI / 180);
+      return { sample: outSample, rawNormalRef: null };
+    }
+    const raw = groundAt(x, z);
+    const rawNormalRef = (raw && typeof raw === 'object' && raw.normal instanceof THREE.Vector3)
+      ? raw.normal
+      : null;
+    resolveGroundSample(groundAt, x, z, outSample, true);
+    if (raw === null || raw === undefined) {
+      outSample.y = fallbackY;
+    }
+    return { sample: outSample, rawNormalRef };
+  }
+
+  /**
+   * Проверяет допустимость точки опоры (foothold) по уклону, перепаду высоты и досягаемости IK.
+   * Если исходная точка небезопасна, выбирает ближайшую безопасную точку опоры.
+   */
+  function selectSafeFoothold(
+    groundAt: any,
+    candX: number,
+    candZ: number,
+    neutralX: number,
+    neutralZ: number,
+    rootY: number,
+    sideSign: number,
+    rightWorld: THREE.Vector3,
+    outSample: GroundSample
+  ): { x: number; z: number; y: number; safe: boolean; rawNormalRef: THREE.Vector3 | null } {
+    const first = queryFootGround(groundAt, candX, candZ, rootY, outSample);
+    if (typeof groundAt !== 'function') {
+      return { x: candX, z: candZ, y: first.sample.y, safe: true, rawNormalRef: first.rawNormalRef };
+    }
+
+    const maxStepDelta = COSMO.maxStepHeightDelta ?? 0.38;
+    const maxReach = THIGH_LEN + SHIN_LEN + FOOT_HEIGHT - 0.02;
+    const hipY = rootY + BASE_PELVIS_Y - 0.05;
+
+    function isCandidateSafe(x: number, z: number, sample: GroundSample): boolean {
+      const n = sample.normal;
+      const slopeAngle = Math.atan2(Math.hypot(n.x, n.z), Math.max(0.05, n.y));
+      const allowedAngle = (sample.maxContactAngle ?? (45 * Math.PI / 180)) + 0.08;
+      if (slopeAngle > allowedAngle) return false;
+      if (Math.abs(sample.y - rootY) > maxStepDelta) return false;
+      const dx = x - neutralX;
+      const dy = sample.y - hipY;
+      const dz = z - neutralZ;
+      if (Math.hypot(dx, dy, dz) > maxReach * 1.05) return false;
+      return true;
+    }
+
+    if (isCandidateSafe(candX, candZ, first.sample)) {
+      return { x: candX, z: candZ, y: first.sample.y, safe: true, rawNormalRef: first.rawNormalRef };
+    }
+
+    // Поиск ближайшей безопасной точки опоры (укорачивание шага и легкий боковой отступ)
+    let bestX = candX;
+    let bestZ = candZ;
+    let bestY = first.sample.y;
+    let bestRawNormal = first.rawNormalRef;
+    let bestScore = Infinity;
+
+    const searchSteps = COSMO.footholdSearchSteps ?? 6;
+    const searchRadius = COSMO.footholdSearchRadius ?? 0.22;
+
+    for (let k = 1; k <= searchSteps; k++) {
+      const t = k / searchSteps;
+      // 1) Кандидат ближе к нейтральной стойке под тазом
+      const shortX = candX + (neutralX - candX) * t;
+      const shortZ = candZ + (neutralZ - candZ) * t;
+      const qShort = queryFootGround(groundAt, shortX, shortZ, rootY, _candGroundSample);
+      if (isCandidateSafe(shortX, shortZ, qShort.sample)) {
+        copySampleFields(_candGroundSample, outSample);
+        return { x: shortX, z: shortZ, y: qShort.sample.y, safe: false, rawNormalRef: qShort.rawNormalRef };
+      }
+      const heightErr = Math.abs(qShort.sample.y - rootY);
+      if (heightErr < bestScore) {
+        bestScore = heightErr;
+        bestX = shortX;
+        bestZ = shortZ;
+        bestY = qShort.sample.y;
+        bestRawNormal = qShort.rawNormalRef;
+        copySampleFields(_candGroundSample, outSample);
+      }
+
+      // 2) Кандидат с небольшим боковым смещением наружу для устойчивой базы
+      const latOffset = sideSign * searchRadius * t * 0.5;
+      const latX = shortX + rightWorld.x * latOffset;
+      const latZ = shortZ + rightWorld.z * latOffset;
+      const qLat = queryFootGround(groundAt, latX, latZ, rootY, _candGroundSample);
+      if (isCandidateSafe(latX, latZ, qLat.sample)) {
+        copySampleFields(_candGroundSample, outSample);
+        return { x: latX, z: latZ, y: qLat.sample.y, safe: false, rawNormalRef: qLat.rawNormalRef };
+      }
+    }
+
+    return { x: bestX, z: bestZ, y: bestY, safe: false, rawNormalRef: bestRawNormal };
+  }
+
+  function copySampleFields(src: GroundSample, dst: GroundSample): void {
+    dst.y = src.y;
+    dst.normal.copy(src.normal);
+    dst.surfaceType = src.surfaceType;
+    dst.colliderHandle = src.colliderHandle;
+    dst.packing = src.packing;
+    dst.friction = src.friction;
+    dst.sink = src.sink;
+    dst.materialId = src.materialId;
+    dst.cohesion = src.cohesion;
+    dst.frictionAngleDeg = src.frictionAngleDeg;
+    dst.bearingCapacity = src.bearingCapacity;
+    dst.maxContactAngle = src.maxContactAngle;
+  }
 
   const robotRig = {
     // Корневой контейнер всего рига
@@ -836,10 +1046,31 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       bankingRoll: 0,
       isSliding: false,
       slideSpeed: 0,
-      isSprinting: false
+      isSprinting: false,
+      slopeAngle: 0,
+      uphillAngle: 0,
+      downhillAngle: 0,
+      crossSlopeAngle: 0,
+      forwardAccel: 0,
+      grounded: true
     },
 
-    setLocomotion({ phase = 0, amount = 0, moveX = 0, moveZ = 0, bankingRoll = 0, isSliding = false, slideSpeed = 0, isSprinting = false } = {}) {
+    setLocomotion({
+      phase = 0,
+      amount = 0,
+      moveX = 0,
+      moveZ = 0,
+      bankingRoll = 0,
+      isSliding = false,
+      slideSpeed = 0,
+      isSprinting = false,
+      slopeAngle = 0,
+      uphillAngle = 0,
+      downhillAngle = 0,
+      crossSlopeAngle = 0,
+      forwardAccel = 0,
+      grounded = true
+    }: any = {}) {
       this.locomotion.phase = phase;
       this.locomotion.amount = THREE.MathUtils.clamp(amount, 0, 1);
       this.locomotion.moveX = moveX;
@@ -848,9 +1079,15 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       this.locomotion.isSliding = Boolean(isSliding);
       this.locomotion.slideSpeed = slideSpeed || 0;
       this.locomotion.isSprinting = Boolean(isSprinting);
+      this.locomotion.slopeAngle = slopeAngle || 0;
+      this.locomotion.uphillAngle = uphillAngle || 0;
+      this.locomotion.downhillAngle = downhillAngle || 0;
+      this.locomotion.crossSlopeAngle = crossSlopeAngle || 0;
+      this.locomotion.forwardAccel = forwardAccel || 0;
+      this.locomotion.grounded = grounded !== false;
     },
 
-    // Мировые IK-цели конечностей
+    // Мировые IK-цели конечностей с расширенным GroundSample
     ikTargets: {
       leftFoot: {
         position: new THREE.Vector3(-0.19, 0.0, 0.0),
@@ -860,7 +1097,17 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
         contactWeight: 1.0,
         normal: null as THREE.Vector3 | null,
         surfaceType: undefined as string | undefined,
-        groundY: 0
+        materialId: 'loose_sand' as string,
+        packing: 0,
+        sink: 0,
+        friction: 0.5,
+        maxContactAngle: 40 * Math.PI / 180,
+        groundY: 0,
+        groundGap: 0,
+        state: 'stance' as 'stance' | 'swing',
+        foothold: new THREE.Vector3(-0.19, 0.0, 0.0),
+        footholdSafe: true,
+        groundSample: createDefaultGroundSample()
       },
       rightFoot: {
         position: new THREE.Vector3(0.19, 0.0, 0.0),
@@ -870,7 +1117,17 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
         contactWeight: 1.0,
         normal: null as THREE.Vector3 | null,
         surfaceType: undefined as string | undefined,
-        groundY: 0
+        materialId: 'loose_sand' as string,
+        packing: 0,
+        sink: 0,
+        friction: 0.5,
+        maxContactAngle: 40 * Math.PI / 180,
+        groundY: 0,
+        groundGap: 0,
+        state: 'stance' as 'stance' | 'swing',
+        foothold: new THREE.Vector3(0.19, 0.0, 0.0),
+        footholdSafe: true,
+        groundSample: createDefaultGroundSample()
       },
       leftHand: {
         position: new THREE.Vector3(-0.39, 0.88, 0.08)
@@ -915,6 +1172,11 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     // Сброс темпоральных рэгдолл-сглаживателей при телепортации или респавне
     resetSmoothing() {
       smoothPelvisDrop = 0;
+      smoothSupportPitch = 0;
+      smoothSupportRoll = 0;
+      smoothComShiftX = 0;
+      smoothAccelPitch = 0;
+      smoothCrossSlopeRoll = 0;
       smoothBobY = 0;
       smoothSwayX = 0;
       smoothRollZ = 0;
@@ -931,11 +1193,20 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
 
       _smoothLeftFootNormal.set(0, 1, 0);
       _smoothRightFootNormal.set(0, 1, 0);
+      footQuatsInitialized = false;
       handPositionsInitialized = false;
+      leftFootMem.wasInStance = false;
+      rightFootMem.wasInStance = false;
+      leftFootMem.prevPhi = -1;
+      rightFootMem.prevPhi = -1;
+      hasPrevRootPos = false;
     },
 
     // Вызывайте один раз за кадр после обновления pose и ikTargets
-    update(groundAt: ((x: number, z: number) => number | { y: number; normal?: THREE.Vector3 | null; surfaceType?: string } | null) | null = null) {
+    update(groundAt: ((x: number, z: number) => any) | null = null) {
+      sanitizeVector3(this.pose.rootPosition, 0, 0, 0);
+      if (!Number.isFinite(this.pose.rootYaw)) this.pose.rootYaw = 0;
+
       const sinYaw = Math.sin(this.pose.rootYaw);
       const cosYaw = Math.cos(this.pose.rootYaw);
       _forwardWorld.set(sinYaw, 0, cosYaw);
@@ -943,6 +1214,18 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
 
       const amount = this.locomotion.amount;
       const phase = this.locomotion.phase;
+
+      // Определяем, перемещался ли корень персонажа в мировом пространстве между кадрами
+      const rootMoveDist = hasPrevRootPos
+        ? Math.hypot(this.pose.rootPosition.x - _prevRootPos.x, this.pose.rootPosition.z - _prevRootPos.z)
+        : 0;
+      if (rootMoveDist > 1.5) {
+        // При телепортации сбрасываем фиксацию стоп
+        leftFootMem.wasInStance = false;
+        rightFootMem.wasInStance = false;
+      }
+      _prevRootPos.copy(this.pose.rootPosition);
+      hasPrevRootPos = true;
 
       // Определение фактического вектора шага в мировых координатах
       let stepDirX = _forwardWorld.x;
@@ -954,57 +1237,63 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       }
 
       const isSprinting = Boolean(this.locomotion.isSprinting);
-      const stride = (isSprinting ? 0.35 : 0.28) * amount;
-      const maxLift = (isSprinting ? 0.14 : 0.10) * amount;
+
+      // Снижение амплитуды шага при плохой опоре (высокая просадка или экстремальный уклон)
+      const avgSink = ((this.ikTargets.leftFoot.sink || 0) + (this.ikTargets.rightFoot.sink || 0)) * 0.5;
+      const slopeSeverity = THREE.MathUtils.clamp((this.locomotion.slopeAngle || 0) / (45 * Math.PI / 180), 0, 1);
+      const supportQualityFactor = 1.0 - Math.min(0.22, avgSink * 0.45 + Math.max(0, slopeSeverity - 0.65) * 0.35);
+
+      const stride = (isSprinting ? 0.35 : 0.28) * amount * supportQualityFactor;
+      const baseMaxLift = (isSprinting ? 0.14 : 0.10) * amount;
 
       const isSliding = this.locomotion.isSliding;
 
       if (isSliding) {
         // === ПОЗА ПЕСЧАНОГО СЕРФИНГА ===
         // Стопы расставлены шире и разнесены в продольной стойке (разножка)
-        // Правая нога вынесена вперед (+0.16м), левая чуть назад (-0.14м), обе прижаты к песку
-        const slideStance = [
-          { leg: leftLeg, target: this.ikTargets.leftFoot, offsetFwd: -0.14, lateral: -0.22, pitch: 0.08 },
-          { leg: rightLeg, target: this.ikTargets.rightFoot, offsetFwd: 0.16, lateral: 0.22, pitch: 0.08 }
-        ];
+        for (let i = 0; i < 2; i++) {
+          const isLeft = i === 0;
+          const target = isLeft ? this.ikTargets.leftFoot : this.ikTargets.rightFoot;
+          const mem = isLeft ? leftFootMem : rightFootMem;
+          const offsetFwd = isLeft ? -0.14 : 0.16;
+          const lateral = isLeft ? -0.22 : 0.22;
+          const neutralX = this.pose.rootPosition.x + _rightWorld.x * lateral + _forwardWorld.x * offsetFwd;
+          const neutralZ = this.pose.rootPosition.z + _rightWorld.z * lateral + _forwardWorld.z * offsetFwd;
 
-        for (let i = 0; i < slideStance.length; i++) {
-          const item = slideStance[i];
-          const neutralX = this.pose.rootPosition.x + _rightWorld.x * item.lateral + _forwardWorld.x * item.offsetFwd;
-          const neutralZ = this.pose.rootPosition.z + _rightWorld.z * item.lateral + _forwardWorld.z * item.offsetFwd;
+          target.position.x = neutralX;
+          target.position.z = neutralZ;
 
-          item.target.position.x = neutralX;
-          item.target.position.z = neutralZ;
-
-          let groundY = this.pose.rootPosition.y;
+          const qGround = queryFootGround(groundAt, target.position.x, target.position.z, this.pose.rootPosition.y, target.groundSample);
+          target.normal = qGround.rawNormalRef;
           if (typeof groundAt === 'function') {
-            const sample = groundAt(item.target.position.x, item.target.position.z);
-            if (typeof sample === 'number') {
-              groundY = sample;
-              item.target.normal = null;
-            } else if (sample && typeof sample.y === 'number') {
-              groundY = sample.y;
-              item.target.normal = sample.normal || null;
-              if (sample.surfaceType) item.target.surfaceType = sample.surfaceType;
-            } else {
-              item.target.normal = null;
-            }
+            target.surfaceType = qGround.sample.surfaceType;
+            target.materialId = qGround.sample.materialId;
+            target.packing = qGround.sample.packing;
+            target.sink = qGround.sample.sink;
+            target.friction = qGround.sample.friction;
+            target.maxContactAngle = qGround.sample.maxContactAngle;
           }
-          item.target.groundY = groundY;
-          item.target.position.y = groundY;
-          item.target.pitch = item.pitch;
-          item.target.contactWeight = 1.0;
+
+          target.groundY = qGround.sample.y;
+          target.position.y = qGround.sample.y;
+          target.groundGap = 0;
+          target.pitch = 0.08;
+          target.roll = 0;
+          target.contactWeight = 1.0;
+          target.state = 'stance';
+          target.foothold.copy(target.position);
+          target.footholdSafe = true;
+          mem.wasInStance = true;
+          mem.lockedWorldPos.copy(target.position);
         }
       } else {
         // 1. Двуногий цикл шага: опорная и маховая фазы ног
-        const legPhases = [
-          { leg: leftLeg, target: this.ikTargets.leftFoot, phi: phase % (Math.PI * 2), side: -1 },
-          { leg: rightLeg, target: this.ikTargets.rightFoot, phi: (phase + Math.PI) % (Math.PI * 2), side: 1 }
-        ];
-
-        for (let i = 0; i < legPhases.length; i++) {
-          const item = legPhases[i];
-          let phi = item.phi;
+        for (let i = 0; i < 2; i++) {
+          const isLeft = i === 0;
+          const target = isLeft ? this.ikTargets.leftFoot : this.ikTargets.rightFoot;
+          const mem = isLeft ? leftFootMem : rightFootMem;
+          const side = isLeft ? -1 : 1;
+          let phi = (isLeft ? phase : phase + Math.PI) % (Math.PI * 2);
           while (phi < 0) phi += Math.PI * 2;
           while (phi >= Math.PI * 2) phi -= Math.PI * 2;
 
@@ -1012,90 +1301,265 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
           let lift = 0;
           let pitch = 0;
           let contactWeight = 1.0;
+          const inSwing = amount > 0.001 && phi < Math.PI;
+
+          // Циркумдукция маховой ноги (небольшая дуга наружу для анатомической естественности)
+          const swingArc = (inSwing && amount > 0.01) ? (Math.sin(phi) * side * 0.022) : 0;
+          const neutralX = this.pose.rootPosition.x + _rightWorld.x * (side * 0.19 + swingArc);
+          const neutralZ = this.pose.rootPosition.z + _rightWorld.z * (side * 0.19 + swingArc);
 
           if (amount > 0.001) {
             if (phi < Math.PI) {
-              // Маховая фаза (Swing Phase): перенос стопы вперед
+              // === МАХОВАЯ ФАЗА (Swing Phase): перенос стопы вперед к проверенному foothold ===
               const p = phi / Math.PI; // 0..1
               u = -Math.cos(p * Math.PI); // от -1 (сзади) до +1 (впереди)
-              lift = Math.sin(p * Math.PI) * (1.0 + 0.22 * Math.cos(p * Math.PI)) * maxLift;
+
+              if (mem.wasInStance) {
+                mem.liftoffWorldPos.copy(mem.lockedWorldPos);
+                mem.liftoffGroundY = target.groundY ?? this.pose.rootPosition.y;
+                mem.wasInStance = false;
+              }
+
+              // Вычисляем и валидируем будущую точку опоры (foothold) впереди (u = +1)
+              const candFootholdX = neutralX + stepDirX * stride;
+              const candFootholdZ = neutralZ + stepDirZ * stride;
+              const safeFh = selectSafeFoothold(
+                groundAt,
+                candFootholdX,
+                candFootholdZ,
+                neutralX,
+                neutralZ,
+                this.pose.rootPosition.y,
+                side,
+                _rightWorld,
+                _scratchGroundSample
+              );
+              target.foothold.set(safeFh.x, safeFh.y, safeFh.z);
+              target.footholdSafe = safeFh.safe;
+
+              // Траектория маховой стопы к выбранному безопасному foothold
+              const effectiveStrideX = safeFh.x - neutralX;
+              const effectiveStrideZ = safeFh.z - neutralZ;
+              target.position.x = neutralX + (u >= 0
+                ? effectiveStrideX * u
+                : stepDirX * (u * stride));
+              target.position.z = neutralZ + (u >= 0
+                ? effectiveStrideZ * u
+                : stepDirZ * (u * stride));
+
+              // Опрос поверхности непосредственно под текущей точкой маха и в середине шага
+              const curGround = queryFootGround(groundAt, target.position.x, target.position.z, this.pose.rootPosition.y, target.groundSample);
+              target.normal = curGround.rawNormalRef;
+              if (typeof groundAt === 'function') {
+                target.surfaceType = curGround.sample.surfaceType;
+                target.materialId = curGround.sample.materialId;
+                target.packing = curGround.sample.packing;
+                target.sink = curGround.sample.sink;
+                target.friction = curGround.sample.friction;
+                target.maxContactAngle = curGround.sample.maxContactAngle;
+              }
+
+              // Адаптация высоты подъема стопы к перепаду высот и препятствиям
+              const stepUpDelta = Math.max(0, safeFh.y - curGround.sample.y);
+              let midObstacleExtra = 0;
+              if (typeof groundAt === 'function') {
+                const midQ = queryFootGround(groundAt, neutralX, neutralZ, this.pose.rootPosition.y, _midGroundSample);
+                const chordY = curGround.sample.y * (1 - p) + safeFh.y * p;
+                midObstacleExtra = Math.max(0, midQ.sample.y - chordY);
+              }
+              const dynamicMaxLift = baseMaxLift + Math.min(0.14, stepUpDelta * 0.45 + midObstacleExtra * 0.75) * amount;
+
+              lift = Math.sin(p * Math.PI) * (1.0 + 0.22 * Math.cos(p * Math.PI)) * dynamicMaxLift;
               contactWeight = Math.max(0, 1.0 - lift / 0.025);
 
+              // Сохраняем heel strike, клиренс носка и отрыв носка (push-off)
               if (p < 0.22) {
-                pitch = -0.22 * (1.0 - p / 0.22); // отрыв носка
+                pitch = -0.22 * (1.0 - p / 0.22); // отрыв носка после push-off
               } else if (p < 0.72) {
                 pitch = 0.14 * Math.sin(((p - 0.22) / 0.50) * Math.PI); // клиренс носка в воздухе
               } else {
-                pitch = 0.18 * ((p - 0.72) / 0.28); // касание пяткой
+                pitch = 0.18 * ((p - 0.72) / 0.28); // подготовка к касанию пяткой (heel strike)
               }
+
+              target.groundY = curGround.sample.y;
+              target.position.y = curGround.sample.y + lift;
+              target.groundGap = lift;
+              target.state = 'swing';
             } else {
-              // Опорная фаза (Stance Phase): линейный накат тела поверх зафиксированной стопы
+              // === ОПОРНАЯ ФАЗА (Stance Phase): удержание мировой точки контакта и перекат ===
               const q = (phi - Math.PI) / Math.PI; // 0..1
-              // Линейная зависимость скорости: устраняет проскальзывание (Foot Skating)
-              u = 1.0 - 2.0 * q; // от +1 до -1 с постоянной относительной скоростью
+              u = 1.0 - 2.0 * q; // от +1 до -1
               lift = 0;
               contactWeight = 1.0;
 
+              // Перекат стопы: heel strike -> плотная опора -> toe roll / push-off
               if (q < 0.20) {
                 pitch = 0.18 * (1.0 - q / 0.20); // опускание с пятки на подошву
               } else if (q < 0.75) {
-                pitch = 0.0; // плотный контакт всей подошвой с песком
+                pitch = 0.0; // плотный контакт всей подошвой с поверхностью
               } else {
-                pitch = -0.22 * ((q - 0.75) / 0.25); // подъем пятки перед толчком
+                pitch = -0.22 * ((q - 0.75) / 0.25); // подъем пятки перед толчком (toe roll & push-off)
               }
+
+              const kinematicX = neutralX + stepDirX * (u * stride);
+              const kinematicZ = neutralZ + stepDirZ * (u * stride);
+
+              // Фиксация опорной стопы в мировых координатах при реальном перемещении корня
+              const phaseContinuous = mem.prevPhi >= Math.PI && phi >= mem.prevPhi && (phi - mem.prevPhi) < 1.2;
+              if (mem.wasInStance && phaseContinuous && rootMoveDist > 1e-4 && q < 0.88) {
+                // Ограничиваем удержание максимальным радиусом шага от нейтральной точки, чтобы исключить разрыв IK
+                const maxHoldRadius = Math.max(0.42, stride * 1.35);
+                const dx = mem.lockedWorldPos.x - neutralX;
+                const dz = mem.lockedWorldPos.z - neutralZ;
+                const distFromNeutral = Math.hypot(dx, dz);
+                if (distFromNeutral <= maxHoldRadius) {
+                  target.position.x = mem.lockedWorldPos.x;
+                  target.position.z = mem.lockedWorldPos.z;
+                } else {
+                  const scaleHold = maxHoldRadius / distFromNeutral;
+                  target.position.x = neutralX + dx * scaleHold;
+                  target.position.z = neutralZ + dz * scaleHold;
+                  mem.lockedWorldPos.x = target.position.x;
+                  mem.lockedWorldPos.z = target.position.z;
+                }
+              } else {
+                target.position.x = kinematicX;
+                target.position.z = kinematicZ;
+                mem.lockedWorldPos.set(target.position.x, target.position.y, target.position.z);
+                mem.wasInStance = true;
+              }
+
+              const stGround = queryFootGround(groundAt, target.position.x, target.position.z, this.pose.rootPosition.y, target.groundSample);
+              target.normal = stGround.rawNormalRef;
+              if (typeof groundAt === 'function') {
+                target.surfaceType = stGround.sample.surfaceType;
+                target.materialId = stGround.sample.materialId;
+                target.packing = stGround.sample.packing;
+                target.sink = stGround.sample.sink;
+                target.friction = stGround.sample.friction;
+                target.maxContactAngle = stGround.sample.maxContactAngle;
+              }
+
+              target.groundY = stGround.sample.y;
+              target.position.y = stGround.sample.y;
+              target.groundGap = 0;
+              target.state = 'stance';
+              target.foothold.copy(target.position);
+              target.footholdSafe = true;
+              mem.lockedWorldPos.y = stGround.sample.y;
             }
-          }
-
-          // Циркумдукция маховой ноги (небольшая дуга наружу для анатомической естественности)
-          const swingArc = (phi < Math.PI && amount > 0.01) ? (Math.sin(phi) * item.side * 0.022) : 0;
-          const neutralX = this.pose.rootPosition.x + _rightWorld.x * (item.side * 0.19 + swingArc);
-          const neutralZ = this.pose.rootPosition.z + _rightWorld.z * (item.side * 0.19 + swingArc);
-
-          item.target.position.x = neutralX + stepDirX * (u * stride);
-          item.target.position.z = neutralZ + stepDirZ * (u * stride);
-
-          // Точное сэмплирование рельефа песка в фактической точке шага
-          let groundY = this.pose.rootPosition.y;
-          if (typeof groundAt === 'function') {
-            const sample = groundAt(item.target.position.x, item.target.position.z);
-            if (typeof sample === 'number') {
-              groundY = sample;
-              item.target.normal = null;
-            } else if (sample && typeof sample.y === 'number') {
-              groundY = sample.y;
-              item.target.normal = sample.normal || null;
-              if (sample.surfaceType) item.target.surfaceType = sample.surfaceType;
+          } else {
+            // Покой (idle stance): проверяем поверхность под стопой
+            target.position.x = neutralX;
+            target.position.z = neutralZ;
+            const idleGround = queryFootGround(groundAt, target.position.x, target.position.z, this.pose.rootPosition.y, target.groundSample);
+            target.normal = idleGround.rawNormalRef;
+            if (typeof groundAt === 'function') {
+              target.surfaceType = idleGround.sample.surfaceType;
+              target.materialId = idleGround.sample.materialId;
+              target.packing = idleGround.sample.packing;
+              target.sink = idleGround.sample.sink;
+              target.friction = idleGround.sample.friction;
+              target.maxContactAngle = idleGround.sample.maxContactAngle;
+            }
+            // Если внешняя система выставила target.position.y вручную без groundAt (как в тесте Soft IK), сохраняем его
+            if (typeof groundAt === 'function') {
+              target.groundY = idleGround.sample.y;
+              target.position.y = idleGround.sample.y;
             } else {
-              item.target.normal = null;
+              target.groundY = target.position.y;
             }
+            target.groundGap = Math.max(0, target.position.y - target.groundY);
+            target.state = 'stance';
+            target.foothold.copy(target.position);
+            target.footholdSafe = true;
+            mem.wasInStance = true;
+            mem.lockedWorldPos.copy(target.position);
           }
-          item.target.groundY = groundY;
-          item.target.position.y = groundY + lift;
 
-          item.target.pitch = pitch;
-          item.target.contactWeight = contactWeight;
+          mem.prevPhi = phi;
+          target.pitch = pitch;
+          target.contactWeight = contactWeight;
         }
       }
 
-      // 2. Биомеханика таза и торса (покачивание, боковой перенос массы, наклон)
+      // 2. Плоскость опоры (Support Plane), таз, корпус и баланс по подтвержденным опорным стопам
+      const lf = this.ikTargets.leftFoot;
+      const rf = this.ikTargets.rightFoot;
+      const lw = THREE.MathUtils.clamp(lf.contactWeight ?? 1.0, 0, 1);
+      const rw = THREE.MathUtils.clamp(rf.contactWeight ?? 1.0, 0, 1);
+      const totalWeight = lw + rw;
+
+      const leftGround = lf.groundY ?? lf.position.y;
+      const rightGround = rf.groundY ?? rf.position.y;
+      const minTerrainY = Math.min(leftGround, rightGround);
+      const maxTerrainY = Math.max(leftGround, rightGround);
+      const rootY = this.pose.rootPosition.y;
+
+      // Боковой перенос центра тяжести к подтвержденной опорной ноге
+      const weightImbalance = totalWeight > 0.05 ? (rw - lw) / totalWeight : 0;
+      const targetComShiftX = isSliding ? 0 : weightImbalance * (COSMO.comShiftLateralMax ?? 0.055) * amount;
+      smoothComShiftX += (targetComShiftX - smoothComShiftX) * (COSMO.pelvisSmoothRate ?? 0.18);
+
+      // Расчет углов наклона плоскости опоры (support plane pitch & roll) по реальным контактам
+      const footDiffY = leftGround - rightGround;
+      const hasTerrainSlope = Math.abs(footDiffY) > 1e-4
+        || Math.abs(leftGround - rootY) > 1e-4
+        || Math.abs(rightGround - rootY) > 1e-4
+        || Math.abs(this.locomotion.slopeAngle || 0) > 1e-4;
+
+      let targetSupportPitch = 0;
+      let targetSupportRoll = 0;
+      if (hasTerrainSlope && totalWeight > 0.1) {
+        const lNorm = lf.normal || lf.groundSample.normal;
+        const rNorm = rf.normal || rf.groundSample.normal;
+        const supportNx = (lNorm.x * lw + rNorm.x * rw) / totalWeight;
+        const supportNy = Math.max(0.1, (lNorm.y * lw + rNorm.y * rw) / totalWeight);
+        const supportNz = (lNorm.z * lw + rNorm.z * rw) / totalWeight;
+
+        const normalPitch = Math.atan2(supportNx * _forwardWorld.x + supportNz * _forwardWorld.z, supportNy);
+        const normalRoll = Math.atan2(-(supportNx * _rightWorld.x + supportNz * _rightWorld.z), supportNy);
+        const heightRoll = Math.atan2(footDiffY, 0.38);
+
+        targetSupportPitch = THREE.MathUtils.clamp(
+          normalPitch * (COSMO.slopePelvisPitchGain ?? 0.35),
+          -0.22,
+          0.22
+        );
+        targetSupportRoll = THREE.MathUtils.clamp(
+          (normalRoll * 0.5 + heightRoll * 0.5) * (COSMO.slopePelvisRollGain ?? 0.40),
+          -0.20,
+          0.20
+        );
+      }
+
+      const pelvisRate = COSMO.pelvisSmoothRate ?? 0.18;
+      const torsoRate = COSMO.torsoSmoothRate ?? 0.20;
+      const headRate = COSMO.headSmoothRate ?? 0.24;
+
+      smoothSupportPitch += (targetSupportPitch - smoothSupportPitch) * pelvisRate;
+      smoothSupportRoll += (targetSupportRoll - smoothSupportRoll) * pelvisRate;
+
+      // Биомеханика таза и торса (покачивание, боковой перенос массы, наклон)
       const bobY = isSliding ? 0 : (-Math.cos(phase * 2.0) * 0.022 * amount);
-      const swayX = isSliding ? 0 : (-Math.sin(phase) * 0.024 * amount);
-      const rollZ = isSliding ? -0.05 : (Math.sin(phase) * 0.035 * amount);
-      const pitchX = isSliding ? -0.12 : ((isSprinting ? 0.055 : 0.035) * amount);
+      const swayX = isSliding ? 0 : (-Math.sin(phase) * 0.024 * amount + smoothComShiftX * 0.35);
+      const rollZ = isSliding ? -0.05 : (Math.sin(phase) * 0.035 * amount + smoothSupportRoll);
+      const pitchX = isSliding ? -0.12 : ((isSprinting ? 0.055 : 0.035) * amount + smoothSupportPitch);
       const yawY = isSliding ? 0.22 : (-Math.sin(phase) * 0.045 * amount);
 
-      // Снижение центра массы таза при спринте (исключает перевыпрямление и щелчки коленных суставов)
+      // Снижение центра массы таза при спринте (ровно 0.045 * amount на плоской поверхности)
       const runPelvisDrop = isSprinting ? (0.045 * amount) : 0;
 
-      // Динамическая адаптация таза к уклону: рассчитывается по высоте рельефа под стопами (groundY),
-      // полностью исключая скачки от махового подъема (lift) ноги в воздухе
-      const leftGround = this.ikTargets.leftFoot.groundY ?? (this.ikTargets.leftFoot.position.y);
-      const rightGround = this.ikTargets.rightFoot.groundY ?? (this.ikTargets.rightFoot.position.y);
-      const minTerrainY = Math.min(leftGround, rightGround);
-      const rootY = this.pose.rootPosition.y;
-      const targetPelvisDrop = Math.min(0, (minTerrainY - rootY) * 0.5);
-      smoothPelvisDrop += (targetPelvisDrop - smoothPelvisDrop) * 0.16;
+      // Динамическая адаптация высоты таза на спусках, неровностях и при ограниченной досягаемости:
+      // на идеально плоской земле (minTerrainY === maxTerrainY === rootY) равна 0.
+      const unevenness = Math.max(0, maxTerrainY - minTerrainY);
+      const downhillFlex = (this.locomotion.downhillAngle || 0) > 0.02
+        ? Math.min(0.06, (this.locomotion.downhillAngle || 0) * 0.09)
+        : 0;
+      const targetPelvisDrop = Math.min(0, (minTerrainY - rootY) * 0.55) - unevenness * 0.22 - downhillFlex;
+      smoothPelvisDrop += (targetPelvisDrop - smoothPelvisDrop) * pelvisRate;
 
+      // Физический корень костюма строго совпадает с rootPosition (без расхождения с коллайдером)
       suitRoot.position.copy(this.pose.rootPosition);
       suitRoot.rotation.y = this.pose.rootYaw;
 
@@ -1112,10 +1576,27 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
         this.pose.pelvisRotation.z + rollZ + bankRoll
       );
 
-      // Противоповорот торса (counter-rotation для компенсации вращательного импульса) + наклон в вираж
+      // Наклон корпуса при разгоне/торможении и компенсация поперечного уклона
+      const targetAccelPitch = THREE.MathUtils.clamp(
+        (this.locomotion.forwardAccel || 0) * (COSMO.accelTorsoLeanGain ?? 0.08) * 0.15,
+        -0.12,
+        0.14
+      );
+      const targetCrossRoll = THREE.MathUtils.clamp(
+        -smoothSupportRoll * (COSMO.crossSlopeTorsoGain ?? 0.28),
+        -0.14,
+        0.14
+      );
+      smoothAccelPitch += (targetAccelPitch - smoothAccelPitch) * torsoRate;
+      smoothCrossSlopeRoll += (targetCrossRoll - smoothCrossSlopeRoll) * torsoRate;
+
       const torsoTwistYaw = isSliding ? -0.18 : (Math.sin(phase) * 0.065 * amount);
-      const torsoLeanPitch = isSliding ? -0.06 : ((isSprinting ? 0.08 : 0.035) * amount);
-      const torsoCounterRoll = isSliding ? 0.04 : (-Math.sin(phase) * 0.02 * amount);
+      const torsoLeanPitch = isSliding
+        ? -0.06
+        : ((isSprinting ? 0.08 : 0.035) * amount + smoothAccelPitch - smoothSupportPitch * 0.45);
+      const torsoCounterRoll = isSliding
+        ? 0.04
+        : (-Math.sin(phase) * 0.02 * amount + smoothCrossSlopeRoll);
 
       torsoGroup.rotation.set(
         this.pose.torsoRotation.x + torsoLeanPitch,
@@ -1123,11 +1604,18 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
         this.pose.torsoRotation.z + torsoCounterRoll + bankRoll * 1.2
       );
 
-      // Стабилизация сенсорной головы (удерживает горизонт камеры)
+      // Стабилизация сенсорной головы с собственной скоростью сглаживания (удерживает горизонт)
+      const targetHeadPitch = -torsoLeanPitch * 0.7 - smoothSupportPitch * 0.35;
+      const targetHeadYaw = -torsoTwistYaw * 0.75;
+      const targetHeadRoll = -torsoCounterRoll * 0.75 - smoothSupportRoll * 0.35;
+      smoothHeadPitch += (targetHeadPitch - smoothHeadPitch) * headRate;
+      smoothHeadYaw += (targetHeadYaw - smoothHeadYaw) * headRate;
+      smoothHeadRoll += (targetHeadRoll - smoothHeadRoll) * headRate;
+
       headGroup.rotation.set(
-        this.pose.headRotation.x - torsoLeanPitch * 0.7,
-        this.pose.headRotation.y - torsoTwistYaw * 0.75,
-        this.pose.headRotation.z - torsoCounterRoll * 0.75
+        this.pose.headRotation.x + (amount > 0 ? targetHeadPitch * 0.65 + smoothHeadPitch * 0.35 : smoothHeadPitch),
+        this.pose.headRotation.y + (amount > 0 ? targetHeadYaw * 0.65 + smoothHeadYaw * 0.35 : smoothHeadYaw),
+        this.pose.headRotation.z + (amount > 0 ? targetHeadRoll * 0.65 + smoothHeadRoll * 0.35 : smoothHeadRoll)
       );
 
       suitRoot.updateMatrixWorld(true);
@@ -1175,7 +1663,6 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
           const forwardOffset = armSign * armSwing;
           const targetX = neutralHandX + stepDirX * forwardOffset;
           const targetZ = neutralHandZ + stepDirZ * forwardOffset;
-          // На махе вперед локоть и кисть сгибаются вверх и вперед естественным образом (атлетичный спринт)
           const flexUp = Math.max(0, forwardOffset) * (isSprinting ? 0.22 : 0.14);
           const targetY = neutralHandY + armLift + flexUp;
 
@@ -1192,34 +1679,60 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
         handPositionsInitialized = true;
       }
 
-      // 4. Решаем Two-Bone 3D IK для обеих ног (со сглаживанием нормали опоры стоп)
-      const footConfigs = [
-        { leg: leftLeg, target: this.ikTargets.leftFoot, smoothNormal: _smoothLeftFootNormal },
-        { leg: rightLeg, target: this.ikTargets.rightFoot, smoothNormal: _smoothRightFootNormal }
-      ];
-
-      for (let i = 0; i < footConfigs.length; i++) {
-        const { leg, target, smoothNormal } = footConfigs[i];
+      // 4. Решаем Two-Bone 3D IK для обеих ног (с плавным quaternion blend стопы по нормали и учетом pitch/roll)
+      const slerpRate = COSMO.footNormalSlerpRate ?? 0.26;
+      for (let i = 0; i < 2; i++) {
+        const isLeft = i === 0;
+        const leg = isLeft ? leftLeg : rightLeg;
+        const target = isLeft ? this.ikTargets.leftFoot : this.ikTargets.rightFoot;
+        const smoothNormal = isLeft ? _smoothLeftFootNormal : _smoothRightFootNormal;
+        const smoothQuat = isLeft ? _smoothLeftFootQuat : _smoothRightFootQuat;
 
         leg.footGroup.position.copy(target.position);
-        if (target.normal) {
-          smoothNormal.lerp(target.normal, 0.22).normalize();
+        const activeNormal = target.normal || (typeof groundAt === 'function' ? target.groundSample.normal : null);
+
+        if (activeNormal && Number.isFinite(activeNormal.x) && Number.isFinite(activeNormal.y) && Number.isFinite(activeNormal.z)) {
+          smoothNormal.lerp(activeNormal, slerpRate).normalize();
           const cw = target.contactWeight !== undefined ? target.contactWeight : 1.0;
-          _plateQuat.setFromUnitVectors(_vUp, _vBlendedNormal.copy(_vUp).lerp(smoothNormal, cw).normalize());
-          _euler.set(target.pitch || 0, this.pose.rootYaw + (target.yawOffset || 0), target.roll || 0, 'YXZ');
+          const alignWeight = target.state === 'swing' ? 0.55 : Math.max(0.65, cw);
+
+          // На поперечном склоне отдельно учитываем продольный pitch и поперечный roll поверхности
+          const surfCrossRoll = Math.atan2(
+            -(smoothNormal.x * _rightWorld.x + smoothNormal.z * _rightWorld.z),
+            Math.max(0.1, smoothNormal.y)
+          ) * alignWeight;
+          target.roll = THREE.MathUtils.clamp(surfCrossRoll, -0.38, 0.38);
+
+          _plateQuat.setFromUnitVectors(_vUp, _vBlendedNormal.copy(_vUp).lerp(smoothNormal, alignWeight).normalize());
+          _euler.set(target.pitch || 0, this.pose.rootYaw + (target.yawOffset || 0), (target.roll || 0) * 0.35, 'YXZ');
           _yawQuat.setFromEuler(_euler);
-          leg.footGroup.quaternion.copy(_plateQuat).multiply(_yawQuat);
+          _targetFootQuat.copy(_plateQuat).multiply(_yawQuat);
+
+          if (!footQuatsInitialized) {
+            smoothQuat.copy(_targetFootQuat);
+          } else {
+            smoothQuat.slerp(_targetFootQuat, Math.min(1.0, slerpRate * 1.4));
+          }
+          leg.footGroup.quaternion.copy(smoothQuat);
         } else {
-          smoothNormal.lerp(_vUp, 0.22).normalize();
-          leg.footGroup.rotation.set(
+          smoothNormal.lerp(_vUp, slerpRate).normalize();
+          _euler.set(
             target.pitch || 0,
             this.pose.rootYaw + (target.yawOffset || 0),
-            target.roll || 0
+            target.roll || 0,
+            'YXZ'
           );
+          _targetFootQuat.setFromEuler(_euler);
+          if (!footQuatsInitialized) {
+            smoothQuat.copy(_targetFootQuat);
+          } else {
+            smoothQuat.slerp(_targetFootQuat, Math.min(1.0, slerpRate * 1.6));
+          }
+          leg.footGroup.quaternion.copy(smoothQuat);
         }
 
         _ankleWorldTarget.copy(target.position);
-        if (target.normal) {
+        if (activeNormal) {
           _ankleWorldTarget.addScaledVector(smoothNormal, FOOT_HEIGHT);
         } else {
           _ankleWorldTarget.y += FOOT_HEIGHT;
@@ -1228,7 +1741,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
 
         leg.hipMount.getWorldPosition(_hipWorldPos);
 
-        // Направление коленного сустава (вперед и наружу)
+        // Направление коленного сустава (вперед и наружу в локальной системе координат персонажа)
         _legPoleWorld.copy(_forwardWorld)
           .multiplyScalar(1.0)
           .addScaledVector(_rightWorld, leg.sideSign * 0.16)
@@ -1241,18 +1754,17 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
           THIGH_LEN,
           SHIN_LEN,
           leg.thighBone,
-          leg.shinBone
+          leg.shinBone,
+          _rightWorld
         );
       }
+      footQuatsInitialized = true;
 
       // 5. Решаем Two-Bone 3D IK для обеих рук
-      const handConfigs = [
-        { arm: leftArm, target: this.ikTargets.leftHand },
-        { arm: rightArm, target: this.ikTargets.rightHand }
-      ];
-
-      for (let i = 0; i < handConfigs.length; i++) {
-        const { arm, target } = handConfigs[i];
+      for (let i = 0; i < 2; i++) {
+        const isLeft = i === 0;
+        const arm = isLeft ? leftArm : rightArm;
+        const target = isLeft ? this.ikTargets.leftHand : this.ikTargets.rightHand;
         arm.shoulderMount.getWorldPosition(_shoulderWorldPos);
         arm.wristTarget.copy(target.position);
 
@@ -1268,7 +1780,8 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
           UPPER_ARM_LEN,
           FOREARM_LEN,
           arm.upperArmBone,
-          arm.forearmBone
+          arm.forearmBone,
+          _rightWorld
         );
       }
 
@@ -1287,25 +1800,74 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       updateAllHydraulicPistons();
     },
 
+    getModelDebug() {
+      const lf = this.ikTargets.leftFoot;
+      const rf = this.ikTargets.rightFoot;
+      return {
+        leftFoot: {
+          position: lf.position.clone(),
+          groundY: lf.groundY,
+          groundGap: lf.groundGap,
+          normal: (lf.normal || lf.groundSample.normal).clone(),
+          contactWeight: lf.contactWeight,
+          state: lf.state,
+          pitch: lf.pitch,
+          roll: lf.roll,
+          surfaceType: lf.surfaceType || lf.groundSample.surfaceType,
+          materialId: lf.materialId || lf.groundSample.materialId,
+          packing: lf.packing,
+          sink: lf.sink,
+          foothold: lf.foothold.clone(),
+          footholdSafe: lf.footholdSafe
+        },
+        rightFoot: {
+          position: rf.position.clone(),
+          groundY: rf.groundY,
+          groundGap: rf.groundGap,
+          normal: (rf.normal || rf.groundSample.normal).clone(),
+          contactWeight: rf.contactWeight,
+          state: rf.state,
+          pitch: rf.pitch,
+          roll: rf.roll,
+          surfaceType: rf.surfaceType || rf.groundSample.surfaceType,
+          materialId: rf.materialId || rf.groundSample.materialId,
+          packing: rf.packing,
+          sink: rf.sink,
+          foothold: rf.foothold.clone(),
+          footholdSafe: rf.footholdSafe
+        },
+        pelvis: {
+          drop: smoothPelvisDrop,
+          supportPitch: smoothSupportPitch,
+          supportRoll: smoothSupportRoll,
+          comShiftX: smoothComShiftX
+        }
+      };
+    },
+
     dispose() {
       if (rigRootGroup.parent) {
         rigRootGroup.parent.remove(rigRootGroup);
       }
+      const geometries = new Set<THREE.BufferGeometry>();
+      const materials = new Set<THREE.Material>();
       rigRootGroup.traverse((obj: THREE.Object3D) => {
         const mesh = obj as THREE.Mesh;
-        if (mesh.geometry) mesh.geometry.dispose();
+        if (mesh.geometry) geometries.add(mesh.geometry);
         if (mesh.material) {
-          if (Array.isArray(mesh.material)) mesh.material.forEach(m => m.dispose());
-          else mesh.material.dispose();
+          if (Array.isArray(mesh.material)) mesh.material.forEach(m => materials.add(m));
+          else materials.add(mesh.material);
         }
       });
+      geometries.forEach(g => g.dispose());
+      materials.forEach(m => m.dispose());
       [desertArmorTex, hazardStripeTex, servoDrumTex, rustyFrameTex, chromeRodTex, rubberHoseTex, amberOpticTex, desertShroudTex].forEach(t => t.dispose());
     }
   };
-    robotRig.resetTargetsToStance();
-    robotRig.update();
-    robotRig.group.scale.setScalar(scale);
-    return robotRig;
+  robotRig.resetTargetsToStance();
+  robotRig.update();
+  robotRig.group.scale.setScalar(scale);
+  return robotRig;
 }
 
 export type PlayerModel = ReturnType<typeof createPlayerModel>;

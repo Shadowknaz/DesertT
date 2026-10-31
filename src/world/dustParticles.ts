@@ -53,6 +53,7 @@ export function createDustSystem({ scene, windAt = null, rng = null }: DustSyste
     const wind = new THREE.Vector3();
     const jitter = new THREE.Vector3();
     let ambientAccumulator = 0.0;
+    let activeCount = 0;
 
     for (let i = 0; i < MAX_PARTICLES; i++) {
         particles.push({
@@ -86,6 +87,7 @@ export function createDustSystem({ scene, windAt = null, rng = null }: DustSyste
             p.life = 0;
             fillState(p);
             spawned++;
+            activeCount++;
         }
     }
 
@@ -186,6 +188,7 @@ export function createDustSystem({ scene, windAt = null, rng = null }: DustSyste
     }
 
     function update(dt: number): void {
+        if (activeCount === 0) return;
         const drag = Math.min(1.0, dt * DUST.dragPerSecond);
 
         for (let i = 0; i < MAX_PARTICLES; i++) {
@@ -195,6 +198,7 @@ export function createDustSystem({ scene, windAt = null, rng = null }: DustSyste
             p.life += dt;
             if (p.life >= p.maxLife) {
                 p.active = false;
+                activeCount--;
                 dummyObj.position.set(0, -100, 0);
                 dummyObj.scale.set(0.001, 0.001, 0.001);
                 dummyObj.updateMatrix();

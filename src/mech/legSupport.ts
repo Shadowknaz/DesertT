@@ -30,6 +30,13 @@ const NORMAL_LIMIT = BODY_WEIGHT * MECH.normalForceLimit;
 
 const ZERO: Vector3Like = { x: 0.0, y: 0.0, z: 0.0 };
 const normalScratch: Vector3Like = { x: 0.0, y: 1.0, z: 0.0 };
+const probeScratch: Vector3Like = { x: 0.0, y: 0.0, z: 0.0 };
+const bodyPosScratch: Vector3Like = { x: 0.0, y: 0.0, z: 0.0 };
+const planeScratch = { supportY: 0.0, pitchSlope: 0.0, rollSlope: 0.0 };
+const feetScratch: LegContactState[] = [];
+const footWeightsScratch: number[] = [];
+const hullPointsScratch: HullPoint[] = [];
+const hullPointsPool: HullPoint[] = Array.from({ length: 12 }, () => ({ x: 0, y: 0, z: 0 }));
 
 export interface SlopesInHeading {
     pitchSlope: number;
@@ -175,7 +182,10 @@ export function computeFootSupport(
     const bodyVel = pose && pose.vel ? pose.vel : ZERO;
     const bodyAngVel = pose && pose.angVel ? pose.angVel : ZERO;
     const probeY = pose && Number.isFinite(pose.y) ? pose.y! : 0.0;
-    const probe: Vector3Like = { x: bodyX, y: probeY, z: bodyZ };
+    probeScratch.x = bodyX;
+    probeScratch.y = probeY;
+    probeScratch.z = bodyZ;
+    const probe = probeScratch;
     // Гистерезис опорной геометрии обновляется только на постпоходной
     // пробе: до походки используется решение прошлого подшага.
     const commit = pose !== null && pose.commitSupport === true;
@@ -185,8 +195,10 @@ export function computeFootSupport(
     let allY = 0.0;
     let minFootGap = Infinity;
     let nearGroundCount = 0;
-    const feet: LegContactState[] = [];
-    const footWeights: number[] = [];
+    const feet = feetScratch;
+    const footWeights = footWeightsScratch;
+    feet.length = 0;
+    footWeights.length = 0;
 
     for (const leg of legs) {
         const foot = leg.currentFootPos;
@@ -318,13 +330,15 @@ export function computeFootSupport(
     // --- Нормальные силы, центр давления и средняя нормаль ----------------
     // Считаются по текущей позе и плоскости, без задержки на подшаг:
     // нормальные силы пишутся в лапы и используются контактным слоем.
-    const bodyPos: Vector3Like = {
-        x: bodyX,
-        y: pose && Number.isFinite(pose.y) ? pose.y! : supportY + MECH.rideHeight,
-        z: bodyZ
-    };
+    bodyPosScratch.x = bodyX;
+    bodyPosScratch.y = pose && Number.isFinite(pose.y) ? pose.y! : supportY + MECH.rideHeight;
+    bodyPosScratch.z = bodyZ;
+    const bodyPos = bodyPosScratch;
     const bodyCom = pose && pose.com ? pose.com : bodyPos;
-    const plane = { supportY, pitchSlope: c, rollSlope: b };
+    planeScratch.supportY = supportY;
+    planeScratch.pitchSlope = c;
+    planeScratch.rollSlope = b;
+    const plane = planeScratch;
 
     // One post-gait solve, including weak force-only contacts.
     let loads: ReturnType<typeof solveNormalLoads> | null = null;
@@ -367,14 +381,25 @@ export function computeFootSupport(
     const slope = Math.hypot(normal.x, normal.z) / Math.max(0.2, normal.y);
 
     // --- Полигон и запас: те же стопы -------------------------------------
-    const hullPoints: HullPoint[] = [];
+    const hullPoints = hullPointsScratch;
+    hullPoints.length = 0;
     let traction = 0.0;
     let sinkSum = 0.0;
     let sinkMax = 0.0;
 
-    for (const leg of feet) {
+    for (let i = 0; i < feet.length; i++) {
+        const leg = feet[i];
         const pos = leg.currentFootPos;
-        hullPoints.push({ x: pos.x, z: pos.z, y: pos.y });
+        let hp = hullPointsPool[i];
+        if (!hp) {
+            hp = { x: pos.x, z: pos.z, y: pos.y };
+            hullPointsPool[i] = hp;
+        } else {
+            hp.x = pos.x;
+            hp.z = pos.z;
+            hp.y = pos.y;
+        }
+        hullPoints.push(hp);
 
         const sink = leg.sink || 0.0;
         sinkSum += sink;

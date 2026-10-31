@@ -1,12 +1,22 @@
 import * as THREE from 'three';
 import { COSMO } from '../config.ts';
 import type { PlayerModel } from './playerModel.ts';
-import type { PlayerController, GroundQuery, PlayerVisualState } from './playerController.ts';
+import type {
+    CosmoContactEvent,
+    GroundQuery,
+    PlayerController,
+    PlayerVisualState
+} from './playerController.ts';
 import type { SandField } from '../world/sandField.ts';
-import type { GroundSamplerResult } from '../world/groundSampler.ts';
+import {
+    createDefaultGroundSample,
+    resolveGroundSample,
+    type GroundSample
+} from '../world/groundSampler.ts';
 import type { ActorRegistration } from '../actor/actorRegistry.ts';
 
 const _ejectVel = new THREE.Vector3();
+const _landingEjectVel = new THREE.Vector3(0, 0.5, 0);
 
 export interface PlayerActorOptions {
     model: PlayerModel;
@@ -50,14 +60,79 @@ export function createPlayerActor({
     let prevRightLift = 0;
     let prevGrounded = true;
     let boundSandField: any = sandField;
+    let currentChunks: any = null;
+    let currentSampler: any = null;
+
+    const leftSampleScratch = createDefaultGroundSample();
+    const rightSampleScratch = createDefaultGroundSample();
+    const eventSampleScratch = createDefaultGroundSample();
+
+    const withdrawMassFn = (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a);
+    const granulesEnv = {
+        windX: 0,
+        windZ: 0,
+        sampleHeight: (x: number, z: number) => currentChunks.sandField.sampleHeight(x, z),
+        sampleGround: (x: number, z: number) => (currentSampler ? currentSampler.sample(x, z) : null),
+        depositMass: (x: number, z: number, amount: number) => currentChunks.sandField.depositMass(x, z, amount),
+        addReserve: (amount: number) => currentChunks.sandField.addReserve(amount)
+    };
+    const locomotionInput = {
+        phase: 0,
+        amount: 0,
+        moveX: 0,
+        moveZ: 0,
+        bankingRoll: 0,
+        isSliding: false,
+        slideSpeed: 0,
+        isSprinting: false,
+        slopeAngle: 0,
+        uphillAngle: 0,
+        downhillAngle: 0,
+        crossSlopeAngle: 0,
+        forwardAccel: 0,
+        grounded: true
+    };
 
     const footprintRadius: number = COSMO.footprintRadius ?? 0.16;
     const footprintDepth: number = COSMO.footprintDepth ?? 0.035;
     const footWidth: number = COSMO.footWidth ?? 0.14;
     const footLength: number = COSMO.footLength ?? 0.24;
+    const baseWeightForce: number = (COSMO.mass ?? 85.0) * Math.abs(COSMO.gravity ?? -18.0);
 
-    function stampFoot(foot: any, depth: number = footprintDepth, compaction: number = 0.12, yaw: number = 0) {
-        if (foot.surfaceType === 'solid') return;
+    function isSolidSurface(surfaceType?: string, materialId?: string): boolean {
+        return surfaceType === 'solid' || materialId === 'stone' || materialId === 'bedrock';
+    }
+
+    function computeFootprintResponse(
+        baseDepth: number,
+        baseCompaction: number,
+        normalLoad: number,
+        speedVal: number,
+        sample: GroundSample
+    ): { depth: number; compaction: number } {
+        const loadRatio = normalLoad > 0 ? THREE.MathUtils.clamp(normalLoad / baseWeightForce, 0.6, 2.2) : 1.0;
+        const speedBonus = 1.0 + THREE.MathUtils.clamp(speedVal / 6.0, 0, 0.35);
+        const packingResistance = 1.0 - 0.45 * THREE.MathUtils.clamp(sample.packing || 0, 0, 1);
+        const sinkSaturation = 1.0 / (1.0 + (sample.sink || 0) * 3.0);
+        const depth = baseDepth * loadRatio * speedBonus * packingResistance * sinkSaturation;
+        const compaction = THREE.MathUtils.clamp(
+            baseCompaction * loadRatio * (1.0 - 0.3 * (sample.packing || 0)),
+            0.04,
+            0.35
+        );
+        return { depth, compaction };
+    }
+
+    function stampFoot(
+        foot: any,
+        depth: number = footprintDepth,
+        compaction: number = 0.12,
+        yaw: number = 0,
+        overrideSample?: GroundSample
+    ) {
+        const surfaceType = overrideSample?.surfaceType ?? foot.surfaceType;
+        const materialId = overrideSample?.materialId ?? foot.materialId;
+        if (isSolidSurface(surfaceType, materialId)) return;
         if (!boundSandField) return;
 
         if (typeof boundSandField.stampSole === 'function') {
@@ -83,6 +158,126 @@ export function createPlayerActor({
         }
         if (typeof syncSand === 'function') {
             syncSand(foot.position.x, foot.position.z, footprintRadius * 1.5);
+        }
+    }
+
+    function resolveEventGround(x: number, z: number, fallbackSample: GroundSample): GroundSample {
+        if (typeof groundAt === 'function') {
+            return resolveGroundSample(groundAt, x, z, eventSampleScratch, true);
+        }
+        return fallbackSample;
+    }
+
+    function processSimulationEvents(events: CosmoContactEvent[], state: PlayerVisualState, lf: any, rf: any) {
+        for (let i = 0; i < events.length; i++) {
+            const ev = events[i];
+            if (ev.type === 'landing') {
+                const lSample = resolveEventGround(lf.position.x, lf.position.z, ev.leftGround || ev.ground);
+                const rSample = resolveEventGround(rf.position.x, rf.position.z, ev.rightGround || ev.ground);
+
+                if (!isSolidSurface(lSample.surfaceType, lSample.materialId)) {
+                    if (dust && typeof dust.spawnSplash === 'function') {
+                        dust.spawnSplash(lf.position, 3, 0.45);
+                    }
+                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                        granules.spawnFootEjection(lf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                    }
+                    const lResp = computeFootprintResponse(
+                        footprintDepth * 1.3,
+                        0.16,
+                        ev.normalLoad,
+                        ev.impactSpeed,
+                        lSample
+                    );
+                    stampFoot(lf, lResp.depth, lResp.compaction, state.yaw, lSample);
+                }
+
+                if (!isSolidSurface(rSample.surfaceType, rSample.materialId)) {
+                    if (dust && typeof dust.spawnSplash === 'function') {
+                        dust.spawnSplash(rf.position, 3, 0.45);
+                    }
+                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                        granules.spawnFootEjection(rf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                    }
+                    const rResp = computeFootprintResponse(
+                        footprintDepth * 1.3,
+                        0.16,
+                        ev.normalLoad,
+                        ev.impactSpeed,
+                        rSample
+                    );
+                    stampFoot(rf, rResp.depth, rResp.compaction, state.yaw, rSample);
+                }
+            } else if (ev.type === 'left_touchdown') {
+                const lSample = resolveEventGround(lf.position.x, lf.position.z, ev.ground);
+                if (!isSolidSurface(lSample.surfaceType, lSample.materialId)) {
+                    const isSprint = ev.isSprinting || Boolean(state.isSprinting);
+                    if (dust && typeof dust.spawnSplash === 'function') {
+                        dust.spawnSplash(lf.position, isSprint ? 4 : 2, isSprint ? 0.55 : 0.35);
+                    }
+                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                        const ejectMult = isSprint ? 2.2 : 1.5;
+                        _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                        granules.spawnFootEjection(
+                            lf.position,
+                            _ejectVel,
+                            isSprint ? 6 : 4,
+                            isSprint ? 0.5 : 0.35,
+                            withdrawMassFn
+                        );
+                    }
+                    const baseD = isSprint ? footprintDepth * 1.35 : footprintDepth;
+                    const baseC = isSprint ? 0.16 : 0.12;
+                    const resp = computeFootprintResponse(baseD, baseC, ev.normalLoad, ev.speed, lSample);
+                    stampFoot(lf, resp.depth, resp.compaction, state.yaw, lSample);
+                }
+            } else if (ev.type === 'right_touchdown') {
+                const rSample = resolveEventGround(rf.position.x, rf.position.z, ev.ground);
+                if (!isSolidSurface(rSample.surfaceType, rSample.materialId)) {
+                    const isSprint = ev.isSprinting || Boolean(state.isSprinting);
+                    if (dust && typeof dust.spawnSplash === 'function') {
+                        dust.spawnSplash(rf.position, isSprint ? 4 : 2, isSprint ? 0.55 : 0.35);
+                    }
+                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                        const ejectMult = isSprint ? 2.2 : 1.5;
+                        _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                        granules.spawnFootEjection(
+                            rf.position,
+                            _ejectVel,
+                            isSprint ? 6 : 4,
+                            isSprint ? 0.5 : 0.35,
+                            withdrawMassFn
+                        );
+                    }
+                    const baseD = isSprint ? footprintDepth * 1.35 : footprintDepth;
+                    const baseC = isSprint ? 0.16 : 0.12;
+                    const resp = computeFootprintResponse(baseD, baseC, ev.normalLoad, ev.speed, rSample);
+                    stampFoot(rf, resp.depth, resp.compaction, state.yaw, rSample);
+                }
+            } else if (ev.type === 'slide') {
+                const lSample = resolveEventGround(lf.position.x, lf.position.z, ev.leftGround || ev.ground);
+                const rSample = resolveEventGround(rf.position.x, rf.position.z, ev.rightGround || ev.ground);
+                if (!isSolidSurface(lSample.surfaceType, lSample.materialId)) {
+                    if (dust && typeof dust.spawnSplash === 'function') {
+                        dust.spawnSplash(lf.position, 1, 0.20);
+                    }
+                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                        _ejectVel.set(-Math.sin(state.yaw) * 2.2, 0.5, -Math.cos(state.yaw) * 2.2);
+                        granules.spawnFootEjection(lf.position, _ejectVel, 2, 0.25, withdrawMassFn);
+                    }
+                    stampFoot(lf, 0.022, 0.10, state.yaw, lSample);
+                }
+                if (!isSolidSurface(rSample.surfaceType, rSample.materialId)) {
+                    if (dust && typeof dust.spawnSplash === 'function') {
+                        dust.spawnSplash(rf.position, 1, 0.20);
+                    }
+                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                        _ejectVel.set(-Math.sin(state.yaw) * 2.2, 0.5, -Math.cos(state.yaw) * 2.2);
+                        granules.spawnFootEjection(rf.position, _ejectVel, 2, 0.25, withdrawMassFn);
+                    }
+                    stampFoot(rf, 0.022, 0.10, state.yaw, rSample);
+                }
+            }
         }
     }
 
@@ -128,16 +323,21 @@ export function createPlayerActor({
             model.pose.pelvisOffset.y = -0.24 * smoothCrouch;
 
             if (typeof model.setLocomotion === 'function') {
-                model.setLocomotion({
-                    phase: state.walkPhase,
-                    amount: state.walkAmount,
-                    moveX: state.moveX,
-                    moveZ: state.moveZ,
-                    bankingRoll: state.bankingRoll || 0,
-                    isSliding: state.isSliding,
-                    slideSpeed: state.slideSpeed,
-                    isSprinting: state.isSprinting
-                });
+                locomotionInput.phase = state.walkPhase;
+                locomotionInput.amount = state.walkAmount;
+                locomotionInput.moveX = state.moveX;
+                locomotionInput.moveZ = state.moveZ;
+                locomotionInput.bankingRoll = state.bankingRoll || 0;
+                locomotionInput.isSliding = state.isSliding;
+                locomotionInput.slideSpeed = state.slideSpeed;
+                locomotionInput.isSprinting = state.isSprinting;
+                locomotionInput.slopeAngle = state.slopeAngle || 0;
+                locomotionInput.uphillAngle = state.uphillAngle || 0;
+                locomotionInput.downhillAngle = state.downhillAngle || 0;
+                locomotionInput.crossSlopeAngle = state.crossSlopeAngle || 0;
+                locomotionInput.forwardAccel = state.forwardAccel || 0;
+                locomotionInput.grounded = state.grounded !== false;
+                model.setLocomotion(locomotionInput);
             }
 
             // IK targets are world-space points. Rebuild the stance after every
@@ -147,32 +347,24 @@ export function createPlayerActor({
             const rf = model.ikTargets.rightFoot;
 
             if (typeof groundAt === 'function') {
-                const leftSample = groundAt(lf.position.x, lf.position.z);
-                const rightSample = groundAt(rf.position.x, rf.position.z);
+                const rawLeft = groundAt(lf.position.x, lf.position.z);
+                const rawRight = groundAt(rf.position.x, rf.position.z);
+                resolveGroundSample(groundAt, lf.position.x, lf.position.z, leftSampleScratch, true);
+                resolveGroundSample(groundAt, rf.position.x, rf.position.z, rightSampleScratch, true);
 
-                if (typeof leftSample === 'number') {
-                    lf.position.y = leftSample;
-                    lf.surfaceType = 'sand';
-                } else if (leftSample && typeof leftSample.y === 'number') {
-                    lf.position.y = leftSample.y;
-                    lf.normal = leftSample.normal || null;
-                    lf.surfaceType = leftSample.surfaceType || 'sand';
-                } else {
-                    lf.position.y = state.position.y;
-                    lf.surfaceType = 'sand';
-                }
+                lf.position.y = (rawLeft !== null && rawLeft !== undefined) ? leftSampleScratch.y : state.position.y;
+                lf.normal = (rawLeft && typeof rawLeft === 'object' && rawLeft.normal) ? rawLeft.normal : null;
+                lf.surfaceType = leftSampleScratch.surfaceType;
+                lf.materialId = leftSampleScratch.materialId;
+                lf.packing = leftSampleScratch.packing;
+                lf.sink = leftSampleScratch.sink;
 
-                if (typeof rightSample === 'number') {
-                    rf.position.y = rightSample;
-                    rf.surfaceType = 'sand';
-                } else if (rightSample && typeof rightSample.y === 'number') {
-                    rf.position.y = rightSample.y;
-                    rf.normal = rightSample.normal || null;
-                    rf.surfaceType = rightSample.surfaceType || 'sand';
-                } else {
-                    rf.position.y = state.position.y;
-                    rf.surfaceType = 'sand';
-                }
+                rf.position.y = (rawRight !== null && rawRight !== undefined) ? rightSampleScratch.y : state.position.y;
+                rf.normal = (rawRight && typeof rawRight === 'object' && rawRight.normal) ? rawRight.normal : null;
+                rf.surfaceType = rightSampleScratch.surfaceType;
+                rf.materialId = rightSampleScratch.materialId;
+                rf.packing = rightSampleScratch.packing;
+                rf.sink = rightSampleScratch.sink;
             } else {
                 lf.position.y = state.position.y;
                 lf.surfaceType = 'sand';
@@ -184,109 +376,93 @@ export function createPlayerActor({
             // на фактическом шаге (stride), исключая проваливание и зависание стоп
             model.update(groundAt);
 
-            // Обработка приземления после прыжка / падения
-            const curGrounded = state.grounded !== false;
-            if (!prevGrounded && curGrounded) {
-                if (lf.surfaceType !== 'solid') {
-                    if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(lf.position, 3, 0.45);
-                        dust.spawnSplash(rf.position, 3, 0.45);
-                    }
-                    if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        granules.spawnFootEjection(lf.position, new THREE.Vector3(0, 0.5, 0), 4, 0.4, (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a));
-                        granules.spawnFootEjection(rf.position, new THREE.Vector3(0, 0.5, 0), 4, 0.4, (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a));
-                    }
-                    stampFoot(lf, footprintDepth * 1.3, 0.16, state.yaw);
-                    stampFoot(rf, footprintDepth * 1.3, 0.16, state.yaw);
-                }
+            if (typeof model.getModelDebug === 'function' && typeof controller.setModelDebug === 'function') {
+                controller.setModelDebug(model.getModelDebug());
             }
-            prevGrounded = curGrounded;
 
-            // Клубы песчаной пыли и отпечатки стоп на песке при касании земли на бегу
-            if (state.walkAmount > 0.15) {
-                const curLeftLift = lf.contactWeight < 0.9 ? 1 : 0;
-                const curRightLift = rf.contactWeight < 0.9 ? 1 : 0;
-                const isSprinting = Boolean(state.isSprinting);
-
-                // Касание левой стопой
-                if (prevLeftLift > 0 && curLeftLift === 0) {
-                    if (lf.surfaceType !== 'solid') {
-                        if (dust && typeof dust.spawnSplash === 'function') {
-                            dust.spawnSplash(lf.position, isSprinting ? 4 : 2, isSprinting ? 0.55 : 0.35);
-                        }
-                        if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                            const ejectMult = isSprinting ? 2.2 : 1.5;
-                            _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
-                            granules.spawnFootEjection(
-                                lf.position,
-                                _ejectVel,
-                                isSprinting ? 6 : 4,
-                                isSprinting ? 0.5 : 0.35,
-                                (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a)
-                            );
-                        }
-                        const curDepth = isSprinting ? footprintDepth * 1.35 : footprintDepth;
-                        stampFoot(lf, curDepth, isSprinting ? 0.16 : 0.12, state.yaw);
-                    }
+            // === Обработка эффектов контакта с поверхностью ===
+            // Если контроллер поддерживает буфер симуляционных событий (consumeContactEvents),
+            // эффекты срабатывают строго по событиям симуляции и никогда не дублируются при повторных syncVisuals(alpha).
+            if (typeof controller.consumeContactEvents === 'function') {
+                const simEvents = controller.consumeContactEvents();
+                if (simEvents.length > 0) {
+                    processSimulationEvents(simEvents, state, lf, rf);
                 }
-
-                // Касание правой стопой
-                if (prevRightLift > 0 && curRightLift === 0) {
-                    if (rf.surfaceType !== 'solid') {
-                        if (dust && typeof dust.spawnSplash === 'function') {
-                            dust.spawnSplash(rf.position, isSprinting ? 4 : 2, isSprinting ? 0.55 : 0.35);
-                        }
-                        if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                            const ejectMult = isSprinting ? 2.2 : 1.5;
-                            _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
-                            granules.spawnFootEjection(
-                                rf.position,
-                                _ejectVel,
-                                isSprinting ? 6 : 4,
-                                isSprinting ? 0.5 : 0.35,
-                                (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a)
-                            );
-                        }
-                        const curDepth = isSprinting ? footprintDepth * 1.35 : footprintDepth;
-                        stampFoot(rf, curDepth, isSprinting ? 0.16 : 0.12, state.yaw);
-                    }
-                }
-
-                prevLeftLift = curLeftLift;
-                prevRightLift = curRightLift;
-            } else if (state.isSliding) {
-                // === ЭФФЕКТЫ ПЕСЧАНОГО СЕРФИНГА ===
-                // Непрерывный шлейф песчаной поземки из-под подошв
-                if (dust && typeof dust.spawnSplash === 'function') {
-                    dust.spawnSplash(lf.position, 1, 0.20);
-                    dust.spawnSplash(rf.position, 1, 0.20);
-                }
-                if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                    _ejectVel.set(-Math.sin(state.yaw) * 2.2, 0.5, -Math.cos(state.yaw) * 2.2);
-                    granules.spawnFootEjection(
-                        lf.position,
-                        _ejectVel,
-                        2,
-                        0.25,
-                        (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a)
-                    );
-                    granules.spawnFootEjection(
-                        rf.position,
-                        _ejectVel,
-                        2,
-                        0.25,
-                        (x: number, z: number, a: number) => boundSandField.withdrawMass(x, z, a)
-                    );
-                }
-                // Непрерывная борозда в песке под скользящими стопами
-                stampFoot(lf, 0.022, 0.10, state.yaw);
-                stampFoot(rf, 0.022, 0.10, state.yaw);
-
-                prevLeftLift = 0;
-                prevRightLift = 0;
+                prevGrounded = state.grounded !== false;
+                prevLeftLift = lf.contactWeight < 0.9 ? 1 : 0;
+                prevRightLift = rf.contactWeight < 0.9 ? 1 : 0;
             } else {
-                prevLeftLift = 0;
-                prevRightLift = 0;
+                // Резервный путь для легковесных unit-тестов с мок-контроллером без simulateStep
+                const curGrounded = state.grounded !== false;
+                if (!prevGrounded && curGrounded) {
+                    if (!isSolidSurface(lf.surfaceType, lf.materialId)) {
+                        if (dust && typeof dust.spawnSplash === 'function') {
+                            dust.spawnSplash(lf.position, 3, 0.45);
+                            dust.spawnSplash(rf.position, 3, 0.45);
+                        }
+                        if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                            granules.spawnFootEjection(lf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                            granules.spawnFootEjection(rf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                        }
+                        stampFoot(lf, footprintDepth * 1.3, 0.16, state.yaw);
+                        stampFoot(rf, footprintDepth * 1.3, 0.16, state.yaw);
+                    }
+                }
+                prevGrounded = curGrounded;
+
+                if (state.walkAmount > 0.15) {
+                    const curLeftLift = lf.contactWeight < 0.9 ? 1 : 0;
+                    const curRightLift = rf.contactWeight < 0.9 ? 1 : 0;
+                    const isSprinting = Boolean(state.isSprinting);
+
+                    if (prevLeftLift > 0 && curLeftLift === 0) {
+                        if (!isSolidSurface(lf.surfaceType, lf.materialId)) {
+                            if (dust && typeof dust.spawnSplash === 'function') {
+                                dust.spawnSplash(lf.position, isSprinting ? 4 : 2, isSprinting ? 0.55 : 0.35);
+                            }
+                            if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                                const ejectMult = isSprinting ? 2.2 : 1.5;
+                                _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                                granules.spawnFootEjection(
+                                    lf.position,
+                                    _ejectVel,
+                                    isSprinting ? 6 : 4,
+                                    isSprinting ? 0.5 : 0.35,
+                                    withdrawMassFn
+                                );
+                            }
+                            const curDepth = isSprinting ? footprintDepth * 1.35 : footprintDepth;
+                            stampFoot(lf, curDepth, isSprinting ? 0.16 : 0.12, state.yaw);
+                        }
+                    }
+
+                    if (prevRightLift > 0 && curRightLift === 0) {
+                        if (!isSolidSurface(rf.surfaceType, rf.materialId)) {
+                            if (dust && typeof dust.spawnSplash === 'function') {
+                                dust.spawnSplash(rf.position, isSprinting ? 4 : 2, isSprinting ? 0.55 : 0.35);
+                            }
+                            if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
+                                const ejectMult = isSprinting ? 2.2 : 1.5;
+                                _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                                granules.spawnFootEjection(
+                                    rf.position,
+                                    _ejectVel,
+                                    isSprinting ? 6 : 4,
+                                    isSprinting ? 0.5 : 0.35,
+                                    withdrawMassFn
+                                );
+                            }
+                            const curDepth = isSprinting ? footprintDepth * 1.35 : footprintDepth;
+                            stampFoot(rf, curDepth, isSprinting ? 0.16 : 0.12, state.yaw);
+                        }
+                    }
+
+                    prevLeftLift = curLeftLift;
+                    prevRightLift = curRightLift;
+                } else {
+                    prevLeftLift = 0;
+                    prevRightLift = 0;
+                }
             }
         },
         updateWorld({ motion, frameDt, weatherState, chunks, sampler }: any) {
@@ -300,18 +476,22 @@ export function createPlayerActor({
                 dust.updateAmbient(motion.bodyPos, frameDt, weatherState);
             }
             if (granules && typeof granules.update === 'function' && chunks?.sandField) {
-                granules.update(frameDt, {
-                    windX: weatherState.windX,
-                    windZ: weatherState.windZ,
-                    sampleHeight: (x: number, z: number) => chunks.sandField.sampleHeight(x, z),
-                    sampleGround: (x: number, z: number) => (sampler ? sampler.sample(x, z) : null),
-                    depositMass: (x: number, z: number, amount: number) => chunks.sandField.depositMass(x, z, amount),
-                    addReserve: (amount: number) => chunks.sandField.addReserve(amount)
-                });
+                currentChunks = chunks;
+                currentSampler = sampler;
+                granulesEnv.windX = weatherState.windX;
+                granulesEnv.windZ = weatherState.windZ;
+                granules.update(frameDt, granulesEnv);
             }
         },
         getDebug() {
-            return controller.getDebug();
+            if (typeof model.getModelDebug === 'function' && typeof controller.setModelDebug === 'function') {
+                controller.setModelDebug(model.getModelDebug());
+            }
+            const ctrlDebug = controller.getDebug() || {};
+            if (typeof model.getModelDebug === 'function') {
+                ctrlDebug.model = model.getModelDebug();
+            }
+            return ctrlDebug;
         },
         dispose() {
             if (model?.dispose) model.dispose();

@@ -51,6 +51,19 @@ export function createGaitController({
     const scratchLocal = new THREE.Vector3();
     const scratchWorld = new THREE.Vector3();
     const scratchTurnLead = new THREE.Quaternion();
+    const group0Legs = legs.filter(leg => leg.gaitGroup === 0);
+    const group1Legs = legs.filter(leg => leg.gaitGroup === 1);
+    const _soleOptions = {
+        useSoleShape: true,
+        terramechanics: true,
+        width: 0.82,
+        length: 0.82,
+        heading: 0,
+        pitch: 0,
+        roll: 0
+    };
+    const _footholdResult = { x: 0, y: 0, z: 0 };
+    const _footKinTranslation = { x: 0, y: 0, z: 0 };
 
     // Точка поджатой лапы в системе корпуса: колено согнуто, стопа под брюхом
     const tuckLocals = legs.map(leg => leg.hipLocal.clone().lerp(leg.restLocal, 0.55));
@@ -190,17 +203,13 @@ export function createGaitController({
         const pitch = Math.atan2(-(nx * sinY + nz * cosY), ny);
         const roll = Math.atan2(nx * cosY - nz * sinY, ny);
 
-        const soleOptions = {
-            useSoleShape: true,
-            terramechanics: true,
-            width: leg.footWidth || 0.82,
-            length: leg.footLength || 0.82,
-            heading: yaw,
-            pitch,
-            roll
-        };
+        _soleOptions.width = leg.footWidth || 0.82;
+        _soleOptions.length = leg.footLength || 0.82;
+        _soleOptions.heading = yaw;
+        _soleOptions.pitch = pitch;
+        _soleOptions.roll = roll;
         sandField.land(leg.currentFootPos.x, leg.currentFootPos.z,
-            SAND.stepFootprintRadius, impactSpeed, load, soleOptions);
+            SAND.stepFootprintRadius, impactSpeed, load, _soleOptions);
         syncSandAt(leg.currentFootPos.x, leg.currentFootPos.z, SAND.stepFootprintRadius * 1.3);
         dust.spawnSplash(leg.currentFootPos, dustCount, dustIntensity);
         if (granules) granules.spawnFootEjection(leg.currentFootPos, leg.slipVelocity, 12, 0.95);
@@ -264,15 +273,11 @@ export function createGaitController({
             const pitch = Math.atan2(-(nx * sinY + nz * cosY), ny);
             const roll = Math.atan2(nx * cosY - nz * sinY, ny);
 
-            const soleOptions = {
-                useSoleShape: true,
-                terramechanics: true,
-                width: leg.footWidth || 0.82,
-                length: leg.footLength || 0.82,
-                heading: yaw,
-                pitch,
-                roll
-            };
+            _soleOptions.width = leg.footWidth || 0.82;
+            _soleOptions.length = leg.footLength || 0.82;
+            _soleOptions.heading = yaw;
+            _soleOptions.pitch = pitch;
+            _soleOptions.roll = roll;
             const contact = sandField.contact(
                 leg.currentFootPos.x,
                 leg.currentFootPos.z,
@@ -282,7 +287,7 @@ export function createGaitController({
                 dt,
                 displacement,
                 isSandAt,
-                soleOptions
+                _soleOptions
             );
             leg.sinkRate = contact.sinkRate;
             if (granules && leg.slip > 0.08) {
@@ -298,10 +303,13 @@ export function createGaitController({
 
     // Запуск шага для активного трипода
     // Адаптивная постановка лап: обход камней, крутых гребней и глубоких воронок
-    function findAdaptiveFoothold(leg: HexapodLeg, idealX: number, idealZ: number): { x: number; y: number; z: number } {
+    function findAdaptiveFoothold(_leg: HexapodLeg, idealX: number, idealZ: number): { x: number; y: number; z: number } {
         const base = sampler.sample(idealX, idealZ);
         if (base.normal.y >= 0.92 && (!base.sink || base.sink < 0.12)) {
-            return { x: idealX, y: base.y, z: idealZ };
+            _footholdResult.x = idealX;
+            _footholdResult.y = base.y;
+            _footholdResult.z = idealZ;
+            return _footholdResult;
         }
 
         let bestX = idealX;
@@ -339,14 +347,18 @@ export function createGaitController({
                 }
             }
         }
-        return { x: bestX, y: bestY, z: bestZ };
+        _footholdResult.x = bestX;
+        _footholdResult.y = bestY;
+        _footholdResult.z = bestZ;
+        return _footholdResult;
     }
 
     function triggerSteps(groupLegs: HexapodLeg[], motion: any): void {
         // Малый поворот для упреждения положения лапы при развороте на месте
         scratchTurnLead.setFromAxisAngle(upAxis, motion.desiredYawRate * GAIT.turnLeadTime);
 
-        groupLegs.forEach(leg => {
+        for (let i = 0; i < groupLegs.length; i++) {
+            const leg = groupLegs[i];
             const idealWorld = scratchWorld
                 .copy(scratchLocal.copy(leg.restLocal).applyQuaternion(scratchTurnLead))
                 .applyQuaternion(motion.bodyQuat).add(motion.bodyPos);
@@ -366,16 +378,15 @@ export function createGaitController({
             leg.stepTargetPos.copy(idealWorld);
 
             sandDust(leg.currentFootPos, 5, 0.5);
-        });
+        }
     }
 
     // Кинематическое тело стопы и IK сегментов ноги
     function applyFootPose(leg: HexapodLeg): void {
-        leg.footRb.setNextKinematicTranslation({
-            x: leg.currentFootPos.x,
-            y: leg.currentFootPos.y + GAIT.footRestOffset,
-            z: leg.currentFootPos.z
-        });
+        _footKinTranslation.x = leg.currentFootPos.x;
+        _footKinTranslation.y = leg.currentFootPos.y + GAIT.footRestOffset;
+        _footKinTranslation.z = leg.currentFootPos.z;
+        leg.footRb.setNextKinematicTranslation(_footKinTranslation);
         solveHexapodLeg(leg, leg.currentFootPos);
     }
 
@@ -550,7 +561,13 @@ export function createGaitController({
                 18, 1.6);
         }
 
-        const anyStepping = legs.some(leg => leg.isStepping);
+        let anyStepping = false;
+        for (let i = 0; i < legs.length; i++) {
+            if (legs[i].isStepping) {
+                anyStepping = true;
+                break;
+            }
+        }
         if (!anyStepping) gaitCooldown -= dt;
 
         // Проверяем, нужно ли активному триподу сделать следующий шаг.
@@ -565,15 +582,16 @@ export function createGaitController({
             const group = unstable
                 ? (groupLoad(0) <= groupLoad(1) ? 0 : 1)
                 : activeGaitGroup;
-            const groupLegs = legs.filter(leg => leg.gaitGroup === group);
+            const groupLegs = group === 0 ? group0Legs : group1Legs;
             let maxError = 0;
 
-            groupLegs.forEach(leg => {
+            for (let i = 0; i < groupLegs.length; i++) {
+                const leg = groupLegs[i];
                 const idealWorld = scratchWorld
                     .copy(scratchLocal.copy(leg.restLocal).applyQuaternion(bodyQuat)).add(bodyPos);
                 const err = Math.hypot(leg.currentFootPos.x - idealWorld.x, leg.currentFootPos.z - idealWorld.z);
                 if (err > maxError) maxError = err;
-            });
+            }
 
             const eps = GAIT.moveSpeedEps;
             const isMovingOrTurning = Math.abs(signedWalkSpeed) > eps || Math.abs(desiredYawRate) > eps;

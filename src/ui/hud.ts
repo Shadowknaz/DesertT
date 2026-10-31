@@ -108,6 +108,7 @@ export function createHud(): HudController {
     // Часы обновляются только когда меняется строка, а не каждый кадр
     let lastLabel = '';
     let lastDebug = '';
+    let lastActorType = '';
     let debugTick = 0;
 
     function update(day: DayInfo, timeScale: number, debug: any = null): void {
@@ -125,8 +126,12 @@ export function createHud(): HudController {
             return;
         }
 
-        // Панель читается человеком: обновляем её 6 раз в секунду
-        if (++debugTick % 10 !== 0) return;
+        const currentActorType = debug.actorType || 'mech';
+        const actorChanged = currentActorType !== lastActorType;
+        lastActorType = currentActorType;
+
+        // Панель читается человеком: обновляем её 6 раз в секунду или сразу при смене актера
+        if (!actorChanged && ++debugTick % 10 !== 0) return;
         debugPanel.style.display = 'block';
 
         const loop = debug.loop || {};
@@ -144,6 +149,20 @@ export function createHud(): HudController {
             return `${weight.toFixed(2)}\u00b7${blend.toFixed(2)}/${Math.round(leg.normalLoad || 0)}`;
         }).join(' ');
 
+        let cosmoExtra = '';
+        if (debug.actorType === 'cosmo' && debug.feet) {
+            const lf = debug.feet.left || {};
+            const rf = debug.feet.right || {};
+            const ev = debug.eventCounts || {};
+            const sDir = debug.slopeDirection || { x: 0, z: 0 };
+            cosmoExtra =
+                `<br>COSMO MAT ${debug.materialId || 'sand'} (${debug.surfaceType || 'sand'}) \u00b7 PACK ${(debug.packing || 0).toFixed(2)} \u00b7 SINK ${(debug.sink || 0).toFixed(3)}m \u00b7 LIM ${debug.movementLimitReason || 'none'}` +
+                `<br>FEET L[${lf.state || '--'} y:${(lf.groundY || 0).toFixed(2)} gap:${(lf.groundGap || 0).toFixed(2)} w:${(lf.contactWeight || 0).toFixed(2)} fh:${lf.footholdSafe !== false ? 'OK' : 'ALT'}] ` +
+                `R[${rf.state || '--'} y:${(rf.groundY || 0).toFixed(2)} gap:${(rf.groundGap || 0).toFixed(2)} w:${(rf.contactWeight || 0).toFixed(2)} fh:${rf.footholdSafe !== false ? 'OK' : 'ALT'}]` +
+                `<br>PHASE ${(debug.gaitPhase || 0).toFixed(2)} \u00b7 SDIR (${(sDir.x || 0).toFixed(2)},${(sDir.z || 0).toFixed(2)}) \u00b7 ` +
+                `EVT TD:${(ev.leftTouchdown || 0) + (ev.rightTouchdown || 0)} LND:${ev.landing || 0} SLD:${ev.slide || 0} SLD_STATE:${debug.isSliding ? 'YES' : 'NO'}`;
+        }
+
         const text =
             `PLANT ${debug.planted} \u00b7 STAB ${debug.stability.toFixed(2)} \u00b7 ` +
             `MARGIN ${(loop.margin || 0).toFixed(2)} m \u00b7 SINK ${debug.sink.toFixed(2)} m<br>` +
@@ -158,6 +177,7 @@ export function createHud(): HudController {
             `GRIP ${(contact.grip || 0).toFixed(2)} \u00b7 SLIDE ${(loop.slide || 0).toFixed(2)} ` +
             `\u00b7 FIELD ${field.attached || 0}/${field.chunks || 0} \u00b7 DEFORM ${field.deformed || 0} ` +
             `\u00b7 PACKED ${field.packed || 0} \u00b7 STEP ${debug.substeps}/3` +
+            cosmoExtra +
             (typeof debug.totalVolume === 'number'
                 ? `<br>VOL L1+L2 ${debug.totalVolume.toFixed(3)} m\u00b3 (RES ${(field.worldReserve || 0).toFixed(3)}) \u00b7 GRANULES ${(debug.granules?.activeCount || 0)} (${(debug.granules?.activeVolume || 0).toFixed(4)} m\u00b3) \u00b7 RET ${(debug.granules?.returnedVolumeTotal || 0).toFixed(4)} m\u00b3<br>` +
                   `SYNC ${Math.round(field.syncLatencyMs || 0)} ms \u00b7 TIME SF ${(field.stepDurationMs || 0).toFixed(1)}ms / LEG ${(contact.stepDurationMs || 0).toFixed(1)}ms / GRN ${(debug.granules?.stepDurationMs || 0).toFixed(1)}ms \u00b7 DROP ${(debug.physicsTiming?.droppedSteps || 0)}`

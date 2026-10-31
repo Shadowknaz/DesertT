@@ -8,7 +8,7 @@ import { CAMERA, CHUNK, PALETTE, PHYSICS, RENDER, SAND, WEATHER } from './config
 import { createPlayerActor } from './character/playerActor.ts';
 import { createPlayerController } from './character/playerController.ts';
 import { createPlayerModel } from './character/playerModel.ts';
-import { getDuneHeight } from './core/duneField.ts';
+import { getDuneHeight, setTerrainSeed } from './core/duneField.ts';
 import { createActorRegistry, type ActorRegistry, type RegisteredActor } from './actor/actorRegistry.ts';
 import { createMechActor } from './actor/mechActor.ts';
 import { createCameraDirector, type CameraDirector } from './control/cameraDirector.ts';
@@ -81,6 +81,24 @@ export interface DioramaApp {
     cameraDirector: CameraDirector;
 }
 
+const _preGaitPose = {
+    y: 0,
+    quat: null as any,
+    com: null as any,
+    vel: null as any,
+    angVel: null as any,
+    solveLoads: false
+};
+const _postGaitPose = {
+    y: 0,
+    quat: null as any,
+    com: null as any,
+    vel: null as any,
+    angVel: null as any,
+    landingGear: false,
+    commitSupport: true
+};
+
 // Shared with headless regressions: this is the application's actual substep.
 export function simulatePhysicsStep(
     { rig, locomotion, gait, contacts, world }: PhysicsStepParams,
@@ -89,14 +107,12 @@ export function simulatePhysicsStep(
     weatherState: any = null
 ) {
     const state = locomotion.readBodyState();
-    const geometry = computeFootSupport(rig.legs, state.bodyPos.x, state.bodyPos.z, {
-        y: state.bodyPos.y,
-        quat: state.bodyQuat,
-        com: state.bodyCom,
-        vel: state.bodyVel,
-        angVel: state.bodyAngVel,
-        solveLoads: false
-    });
+    _preGaitPose.y = state.bodyPos.y;
+    _preGaitPose.quat = state.bodyQuat;
+    _preGaitPose.com = state.bodyCom;
+    _preGaitPose.vel = state.bodyVel;
+    _preGaitPose.angVel = state.bodyAngVel;
+    const geometry = computeFootSupport(rig.legs, state.bodyPos.x, state.bodyPos.z, _preGaitPose);
     const planned = locomotion.plan(dt, geometry, command, state, weatherState);
     const result = gait.update(dt, planned);
     if (result.finishedStep) locomotion.registerStepImpact();
@@ -106,15 +122,13 @@ export function simulatePhysicsStep(
     // Keep plan flags/drive targets but refresh the physical snapshot before
     // the single post-gait load solve, attitude damping and sand interaction.
     Object.assign(planned, locomotion.readBodyState());
-    const support = computeFootSupport(rig.legs, planned.bodyPos.x, planned.bodyPos.z, {
-        y: planned.bodyPos.y,
-        quat: planned.bodyQuat,
-        com: planned.bodyCom,
-        vel: planned.bodyVel,
-        angVel: planned.bodyAngVel,
-        landingGear: planned.landingGear,
-        commitSupport: true
-    });
+    _postGaitPose.y = planned.bodyPos.y;
+    _postGaitPose.quat = planned.bodyQuat;
+    _postGaitPose.com = planned.bodyCom;
+    _postGaitPose.vel = planned.bodyVel;
+    _postGaitPose.angVel = planned.bodyAngVel;
+    _postGaitPose.landingGear = Boolean(planned.landingGear);
+    const support = computeFootSupport(rig.legs, planned.bodyPos.x, planned.bodyPos.z, _postGaitPose);
     const motion = locomotion.finalize(support, planned, weatherState);
     contacts.solve(motion, support, dt);
     gait.applySand(dt, motion);
@@ -149,10 +163,21 @@ export async function createDioramaApp(): Promise<DioramaApp> {
     // Ниже прежней орбиты: в кадр попадает горизонт и полоса неба над ним
     camera.position.set(13, 4.0, 15);
 
+    const isSoftwareGl = (() => {
+        if (typeof document === 'undefined') return false;
+        const gl = document.createElement('canvas').getContext('webgl2');
+        if (!gl) return true;
+        const ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const param = ext ? ext.UNMASKED_RENDERER_WEBGL : gl.RENDERER;
+        const gpu = String(gl.getParameter(param));
+        gl.getExtension('WEBGL_lose_context')?.loseContext();
+        return /SwiftShader|llvmpipe|softpipe|Software|Basic Render/i.test(gpu);
+    })();
+
     const renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(1);
-    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.enabled = !isSoftwareGl;
     renderer.shadowMap.type = THREE.BasicShadowMap; // Грубые пиксельные тени PS1
     document.body.appendChild(renderer.domElement);
 
@@ -177,12 +202,14 @@ export async function createDioramaApp(): Promise<DioramaApp> {
     // ?weather=sandstorm&time=0.62&timeScale=0&clouds=0.6&seed=1337
     const query = typeof window !== 'undefined' && window.location ? new URLSearchParams(window.location.search) : new URLSearchParams();
     const requestedSeed = query.get('seed') ? Number.parseInt(query.get('seed')!, 10) : 1337;
+    const worldSeed = Number.isFinite(requestedSeed) ? requestedSeed : 1337;
+    setTerrainSeed(worldSeed);
 
     // Погода владеет ветром, порывами, туманом и облачностью: остальные системы
     // читают ее снимок, но не меняют его.
     const weather = createWeather({
         scene,
-        seed: Number.isFinite(requestedSeed) ? requestedSeed : 1337
+        seed: worldSeed
     });
 
     const requestedWeather = query.get('weather');
@@ -266,6 +293,10 @@ export async function createDioramaApp(): Promise<DioramaApp> {
             hud.updateHints(actor.hintsKey);
             if (cameraDirector && actor.cameraConfig) {
                 cameraDirector.setActorCamera(actor.cameraConfig);
+            }
+            const pose = actor.getPose?.();
+            if (pose?.position) {
+                chunks.update(pose.position, CHUNK.preloadBudget);
             }
         }
     });
@@ -352,9 +383,50 @@ export async function createDioramaApp(): Promise<DioramaApp> {
 
     // --- Главный цикл симуляции и рендеринга ---
     let animId: number | null = null;
-    function animate() {
-        animId = requestAnimationFrame(animate);
+    function afterDraw(cb: () => void) {
+        const gl = renderer.getContext() as WebGL2RenderingContext;
+        if (!gl || typeof gl.fenceSync !== 'function') {
+            animId = window.setTimeout(cb, 80);
+            return;
+        }
+        const sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        gl.flush();
+        const poll = () => {
+            const state = sync && gl.getSyncParameter(sync, gl.SYNC_STATUS);
+            if (state === gl.UNSIGNALED) {
+                animId = window.setTimeout(poll, 5);
+            } else {
+                if (sync) gl.deleteSync(sync);
+                animId = window.setTimeout(cb, 80);
+            }
+        };
+        animId = window.setTimeout(poll, 5);
+    }
 
+    const camDir = new THREE.Vector3();
+    const commandCtx: any = {
+        bodyPos: null,
+        currentYaw: 0,
+        flatFwd: null,
+        cameraAzimuth: 0,
+        actions: null
+    };
+    const chunkUpdateEnv: any = {
+        dt: 0,
+        frameDt: 0,
+        weather: null,
+        sunDir: null
+    };
+    const actorWorldEnv: any = {
+        motion: null,
+        frameDt: 0,
+        simulatedDt: 0,
+        weatherState: null,
+        chunks,
+        sampler
+    };
+
+    function animate() {
         // Кадровое время обрезается: после фоновой вкладки физика
         // не должна догонять мир десятками подшагов.
         const elapsedDt = clock.getDelta();
@@ -370,17 +442,15 @@ export async function createDioramaApp(): Promise<DioramaApp> {
         const activeActor = actorRegistry.getActiveActor();
         if (!activeActor) return;
         const activePose = activeActor.getPose();
-        const camDir = new THREE.Vector3();
         camera.getWorldDirection(camDir);
         const cameraAzimuth = Math.atan2(camDir.x, camDir.z);
 
-        const command = activeActor.controller.update(frameDt, {
-            bodyPos: activePose.position,
-            currentYaw: activePose.currentYaw ?? activePose.yaw ?? 0,
-            flatFwd: activePose.flatFwd,
-            cameraAzimuth,
-            actions: inputRouter.getActions(activeActor.contextId)
-        });
+        commandCtx.bodyPos = activePose.position;
+        commandCtx.currentYaw = activePose.currentYaw ?? activePose.yaw ?? 0;
+        commandCtx.flatFwd = activePose.flatFwd;
+        commandCtx.cameraAzimuth = cameraAzimuth;
+        commandCtx.actions = inputRouter.getActions(activeActor.contextId);
+        const command = activeActor.controller.update(frameDt, commandCtx);
 
         // 3. Фиксированные подшаги: локомотив, походка, контакт с песком
         //    и world.step(). Аккумулятор убирает зависимость от FPS.
@@ -405,21 +475,18 @@ export async function createDioramaApp(): Promise<DioramaApp> {
 
         // 5. Стриминг мира: подгрузка ближних чанков, выгрузка далеких,
         //    ветер переносит песок и толкает обломки
-        chunks.update(lastMotion.bodyPos, CHUNK.buildBudget, {
-            dt: simulatedDt,
-            frameDt,
-            weather: weatherState
-        });
+        chunkUpdateEnv.dt = simulatedDt;
+        chunkUpdateEnv.frameDt = frameDt;
+        chunkUpdateEnv.weather = weatherState;
+        chunkUpdateEnv.sunDir = dayState.keyDir;
+        chunks.update(lastMotion.bodyPos, CHUNK.buildBudget, chunkUpdateEnv);
 
         // 6. Пыль, песчаная буря и actor-specific world effects
-        activeActor.updateWorld({
-            motion: lastMotion,
-            frameDt,
-            simulatedDt,
-            weatherState,
-            chunks,
-            sampler
-        });
+        actorWorldEnv.motion = lastMotion;
+        actorWorldEnv.frameDt = frameDt;
+        actorWorldEnv.simulatedDt = simulatedDt;
+        actorWorldEnv.weatherState = weatherState;
+        activeActor.updateWorld(actorWorldEnv);
         dust.update(frameDt);
         sandStorm.update(frameDt, lastMotion.bodyPos, weatherState, camera.position);
 
@@ -462,6 +529,9 @@ export async function createDioramaApp(): Promise<DioramaApp> {
         cameraDirector.applyShake(weatherState);
         pipeline.render(scene, camera);
         cameraDirector.revertShake();
+
+        if (isSoftwareGl) afterDraw(animate);
+        else animId = requestAnimationFrame(animate);
     }
 
     const onResize = () => {
@@ -473,7 +543,10 @@ export async function createDioramaApp(): Promise<DioramaApp> {
     window.addEventListener('resize', onResize);
 
     function dispose() {
-        if (animId !== null) cancelAnimationFrame(animId);
+        if (animId !== null) {
+            cancelAnimationFrame(animId);
+            clearTimeout(animId);
+        }
         window.removeEventListener('resize', onResize);
         if (inputRouter?.dispose) inputRouter.dispose();
         if (deviceState?.dispose) deviceState.dispose();

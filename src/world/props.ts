@@ -1,11 +1,15 @@
-// Реквизит одного чанка: детерминированные скалы со своими коллайдерами
-// и динамические обломки, которые мех расталкивает лапами.
-// Позиции выводятся из индексов чанка, поэтому мир воспроизводим при перезагрузке.
+// Реквизит и геологическая детализация одного чанка:
+// 1. Инстансированная россыпь мелкой пустынной гальки, щебня и обломков породы (InstancedMesh),
+//    привязанная к каменистым почвам Рег и междюнному рельефу (без накладных расходов физики).
+// 2. Полузасыпанные песком слоистые плиты песчаника и коренные выходы породы (InstancedMesh).
+// 3. Крупные скальные образования (валуны, ярданги) со своими коллайдерами Rapier
+//    и динамические перекатывающиеся камни.
 import * as THREE from 'three';
 import { RAPIER } from './physics.ts';
 import { CHUNK, DIORAMA } from '../config.ts';
 import { hash2 } from '../core/noise.ts';
 import { getDuneHeight, getDuneNormal, getMountainMask, getBiomeWeights } from '../core/duneField.ts';
+import { computeSoilWeightsAt } from './terrain.ts';
 import type { WeatherState } from './weather.ts';
 
 const UP_AXIS = new THREE.Vector3(0, 1, 0);
@@ -52,9 +56,15 @@ function insideClearZone(x: number, z: number, clearZone?: ClearZone | null): bo
     return dx * dx + dz * dz < clearZone.radius * clearZone.radius;
 }
 
+// Коридор стартового движения возле (0, 0..22) остаётся свободным от крупных физических преград
+function insideSpawnCorridor(x: number, z: number): boolean {
+    return Math.abs(x) < 4.5 && z > -6.0 && z < 24.0;
+}
+
 export interface ChunkPropsMaterials {
     rock: THREE.Material;
     debris: THREE.Material;
+    pebble?: THREE.Material;
 }
 
 export interface ChunkPropsOptions {
@@ -67,6 +77,7 @@ export interface ChunkPropsOptions {
     debrisGeometry: THREE.BufferGeometry;
     slabGeometry?: THREE.BufferGeometry;
     poleGeometry?: THREE.BufferGeometry;
+    pebbleGeometry?: THREE.BufferGeometry;
     clearZone?: ClearZone | null;
     enabled?: boolean;
 }
@@ -94,7 +105,7 @@ export function createChunkProps({
     slabGeometry,
     poleGeometry,
     clearZone,
-    enabled = true
+    enabled = false
 }: ChunkPropsOptions): ChunkProps {
     if (!enabled) {
         return {
@@ -110,18 +121,18 @@ export function createChunkProps({
     const originZ = cz * size;
     const rng = makeRng(cx, cz);
 
-    const meshes: THREE.Mesh[] = [];
+    const meshes: THREE.Object3D[] = [];
+    const instancedMeshes: THREE.InstancedMesh[] = [];
     const staticBodies: any[] = [];
     const debris: DebrisProp[] = [];
 
-    // Определение биома и маски гор для геологически обоснованного спавна
+    // Определение биома и маски гор для геологически обоснованного спавна крупных скал
     const biomes = getBiomeWeights(originX + halfSize, originZ + halfSize);
     const mountain = getMountainMask(originX + halfSize, originZ + halfSize);
 
-    // --- Крупные скальные образования: валуны, плиты и ярданги ---
-    // В Эрге скалы занесены толщей барханов, в горах и на месах их больше
-    const rockChance = 1.4 * (1.0 - biomes.erg * 0.85) + mountain * 2.0 + biomes.mesa * 1.2;
-    const rockCount = Math.floor(rng() * rockChance);
+    // --- Крупные скальные образования ---
+    const rockChance = 1.8 * (1.0 - biomes.erg * 0.65) + mountain * 2.2 + biomes.mesa * 1.4;
+    const rockCount = Math.floor(rng() * rockChance + 0.35);
 
     for (let i = 0; i < rockCount; i++) {
         const lx = (rng() - 0.5) * (size - 7);
@@ -129,43 +140,59 @@ export function createChunkProps({
         const groundX = originX + lx;
         const groundZ = originZ + lz;
         if (insideClearZone(groundX, groundZ, clearZone)) continue;
+        if (insideSpawnCorridor(groundX, groundZ)) continue;
 
         const normal = getDuneNormal(groundX, groundZ);
         const slope = Math.hypot(normal.x, normal.z);
-        // В чистом песке без уклона скалы не удерживаются
-        if (biomes.erg > 0.4 && slope < 0.22) continue;
+        const h = getDuneHeight(groundX, groundZ);
+        const soil = computeSoilWeightsAt(groundX, groundZ, h, slope, 0.0);
 
-        // Выбор формы породы: валун, плита песчаника или ветровой ярданг
+        // В чистом песке без каменистой почвы и уклона крупные скалы редки
+        if (biomes.erg > 0.55 && slope < 0.14 && soil.gravelReg < 0.25) continue;
+
         const typeRoll = rng();
         let geom = rockGeometry;
-        let sx = 1.6 + rng() * 1.5;
-        let sy = 1.7 + rng() * 2.4;
-        let sz = 1.6 + rng() * 1.3;
+        let sx = 1.4 + rng() * 1.5;
+        let sy = 1.2 + rng() * 2.1;
+        let sz = 1.4 + rng() * 1.3;
 
-        if (biomes.mesa > 0.25 && typeRoll < 0.55 && slabGeometry) {
+        if ((biomes.mesa > 0.22 || soil.bareRock > 0.25) && typeRoll < 0.55 && slabGeometry) {
             geom = slabGeometry;
-            sx = 2.0 + rng() * 1.6;
-            sy = 0.8 + rng() * 0.6;
-            sz = 2.0 + rng() * 1.6;
+            sx = 1.8 + rng() * 1.6;
+            sy = 0.65 + rng() * 0.65;
+            sz = 1.8 + rng() * 1.6;
         }
 
-        const h = getDuneHeight(groundX, groundZ);
-
-        // Валун ложится по нормали склона и случайно доворачивается вокруг нее:
-        // на крутых склонах скалы плотно сидят в породе и не висят краем.
         const tilt = new THREE.Quaternion().setFromUnitVectors(UP_AXIS, normal);
         const spin = new THREE.Quaternion().setFromAxisAngle(normal, rng() * Math.PI * 2);
 
         const mesh = new THREE.Mesh(geom, materials.rock);
-        // У ярданга основание должно касаться поверхности, иначе нижняя часть
-        // тонет в склоне и визуально оставляет один острый выступ.
         mesh.quaternion.copy(tilt).multiply(spin);
         mesh.scale.set(sx, sy, sz);
-        mesh.position.set(groundX, h + supportOffset(geom, mesh.scale, mesh.quaternion) - 0.08, groundZ);
+        mesh.position.set(groundX, h + supportOffset(geom, mesh.scale, mesh.quaternion) - 0.12, groundZ);
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         scene.add(mesh);
         meshes.push(mesh);
+
+        // Вторичный прислонённый обломок породы у основания крупного валуна (составной силуэт)
+        if (slabGeometry && rng() > 0.35) {
+            const subAngle = rng() * Math.PI * 2;
+            const subDist = Math.max(sx, sz) * 0.62;
+            const subX = groundX + Math.cos(subAngle) * subDist;
+            const subZ = groundZ + Math.sin(subAngle) * subDist;
+            const subH = getDuneHeight(subX, subZ);
+            const subMesh = new THREE.Mesh(slabGeometry, materials.rock);
+            subMesh.scale.set(sx * 0.52, sy * 0.38, sz * 0.48);
+            subMesh.quaternion.copy(tilt).multiply(
+                new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), 0.28)
+            );
+            subMesh.position.set(subX, subH + sy * 0.12, subZ);
+            subMesh.castShadow = true;
+            subMesh.receiveShadow = true;
+            scene.add(subMesh);
+            meshes.push(subMesh);
+        }
 
         const body = world.createRigidBody(
             RAPIER.RigidBodyDesc.fixed()
@@ -173,19 +200,19 @@ export function createChunkProps({
                 .setRotation(mesh.quaternion)
         );
         world.createCollider(
-            RAPIER.ColliderDesc.cuboid(sx * 0.7, sy * 0.7, sz * 0.7).setFriction(0.9),
+            RAPIER.ColliderDesc.cuboid(sx * 0.68, sy * 0.68, sz * 0.68).setFriction(0.9),
             body
         );
         staticBodies.push(body);
     }
 
-    // --- Редкий микро-реквизит: навигационные маркерные шесты экспедиций ---
-    if (poleGeometry && rng() > 0.82) {
+    // --- 4. Редкий микро-реквизит: навигационные маркерные шесты экспедиций ---
+    if (poleGeometry && rng() > 0.84) {
         const px = (rng() - 0.5) * (size - 10);
         const pz = (rng() - 0.5) * (size - 10);
         const poleX = originX + px;
         const poleZ = originZ + pz;
-        if (!insideClearZone(poleX, poleZ, clearZone)) {
+        if (!insideClearZone(poleX, poleZ, clearZone) && !insideSpawnCorridor(poleX, poleZ)) {
             const h = getDuneHeight(poleX, poleZ);
             const normal = getDuneNormal(poleX, poleZ);
             const poleTilt = new THREE.Quaternion().setFromUnitVectors(UP_AXIS, normal);
@@ -216,26 +243,31 @@ export function createChunkProps({
         }
     }
 
-    // --- Динамические перекатывающиеся камни ---
-    // В Реге (каменистой равнине) камней больше, в Эрге меньше
-    const debrisBase = 2 + Math.floor(rng() * 3 + biomes.reg * 3 - biomes.erg * 1.5);
-    const debrisCount = Math.max(1, Math.min(7, debrisBase));
+    // --- 5. Динамические перекатывающиеся камни ---
+    const debrisBase = 2 + Math.floor(rng() * 3 + biomes.reg * 3 - biomes.erg * 1.2);
+    const debrisCount = Math.max(1, Math.min(6, debrisBase));
     for (let i = 0; i < debrisCount; i++) {
         let lx = 0;
         let lz = 0;
-        // Пара попыток не уронить обломок прямо на меха
-        for (let attempt = 0; attempt < 4; attempt++) {
+        let validSpot = false;
+        for (let attempt = 0; attempt < 6; attempt++) {
             lx = (rng() - 0.5) * (size - 5);
             lz = (rng() - 0.5) * (size - 5);
-            if (!insideClearZone(originX + lx, originZ + lz, clearZone)) break;
+            const wx = originX + lx;
+            const wz = originZ + lz;
+            if (!insideClearZone(wx, wz, clearZone) && !insideSpawnCorridor(wx, wz)) {
+                validSpot = true;
+                break;
+            }
         }
+        if (!validSpot) continue;
 
-        const radius = 0.32 + rng() * 0.38;
+        const radius = 0.28 + rng() * 0.34;
         const h = getDuneHeight(originX + lx, originZ + lz);
 
         const mesh = new THREE.Mesh(debrisGeometry, materials.debris);
         mesh.scale.setScalar(radius);
-        mesh.position.set(originX + lx, h + radius * 0.9, originZ + lz);
+        mesh.position.set(originX + lx, h + radius * 0.85, originZ + lz);
         mesh.castShadow = true;
         mesh.receiveShadow = true;
         scene.add(mesh);
@@ -258,15 +290,10 @@ export function createChunkProps({
         debris.push({ mesh, body, radius });
     }
 
-    // Синхронизация визуальных камней с физикой и удержание их внутри чанка.
-    // Улетевший обломок возвращается на случайный склон этого же чанка.
-    // Ветер толкает обломки импульсом за прошедшее время, поэтому сила
-    // не зависит от числа подшагов физики в кадре.
     function update(wind: WeatherState | null, dt = 0.0): void {
         const localSpeed = wind ? Math.hypot(wind.windX, wind.windZ) : 0.0;
         const gust = wind ? wind.gust : 0.0;
         const invSpeed = localSpeed > 0.001 ? 1.0 / localSpeed : 0.0;
-        // Ускорение от напора воздуха; порывы усиливают толчок
         const accel = localSpeed * (0.24 + gust * 0.22);
         const forceX = wind ? wind.windX * invSpeed * accel : 0.0;
         const forceZ = wind ? wind.windZ * invSpeed * accel : 0.0;
@@ -286,9 +313,11 @@ export function createChunkProps({
             if (outOfChunk) {
                 const nx = originX + (rng() - 0.5) * (size - 8);
                 const nz = originZ + (rng() - 0.5) * (size - 8);
-                prop.body.setTranslation({ x: nx, y: getDuneHeight(nx, nz) + prop.radius * 0.9, z: nz }, true);
-                prop.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
-                prop.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                if (!insideClearZone(nx, nz, clearZone) && !insideSpawnCorridor(nx, nz)) {
+                    prop.body.setTranslation({ x: nx, y: getDuneHeight(nx, nz) + prop.radius * 0.85, z: nz }, true);
+                    prop.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+                    prop.body.setAngvel({ x: 0, y: 0, z: 0 }, true);
+                }
             }
 
             const pp = prop.body.translation();
@@ -298,8 +327,6 @@ export function createChunkProps({
         });
     }
 
-    // Взрыв толкает обломки: импульс падает к краю радиуса, а вверх
-    // добавляется надбавка, чтобы камни не просто катились, а подлетали.
     function blastAt(origin: THREE.Vector3 | { x: number; y: number; z: number }, radius: number, strength: number): void {
         debris.forEach(prop => {
             const p = prop.body.translation();
@@ -329,8 +356,11 @@ export function createChunkProps({
         });
         staticBodies.forEach(body => world.removeRigidBody(body));
         meshes.forEach(mesh => scene.remove(mesh));
+        instancedMeshes.forEach(inst => {
+            scene.remove(inst);
+            inst.dispose();
+        });
     }
 
     return { update, blastAt, dispose };
 }
-

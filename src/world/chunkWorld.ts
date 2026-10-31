@@ -4,8 +4,9 @@
 import * as THREE from 'three';
 import { CHUNK, DIORAMA, PALETTE, PS1_SNAP } from '../config.ts';
 import { chunkCoordAt, chunkKeyOf } from '../core/chunkCoords.ts';
-import { createMechTexture } from '../core/textures.ts';
-import { applyPS1VertexSnap } from '../render/ps1Material.ts';
+import { getDuneOrientation } from '../core/duneField.ts';
+import { createRockTexture, createSandDetailTexture, createSandTexture } from '../core/textures.ts';
+import { applyDesertSurfaceShader, applyPS1VertexSnap } from '../render/ps1Material.ts';
 import { createChunkProps, type ChunkProps } from './props.ts';
 import { createSandDeformer, type SandDeformer } from './sandDeformation.ts';
 import { createSandField, type SandField } from './sandField.ts';
@@ -23,6 +24,7 @@ export interface ChunkEnvironment {
     dt?: number;
     frameDt?: number;
     weather?: WeatherState | null;
+    sunDir?: THREE.Vector3 | null;
 }
 
 export interface ChunkWorldOptions {
@@ -42,12 +44,22 @@ export interface ChunkWorld {
 }
 
 export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorld {
-    const sandMaterial = applyPS1VertexSnap(new THREE.MeshLambertMaterial({
+    const sandTexture = createSandTexture();
+    const sandDetailTexture = createSandDetailTexture();
+
+    const baseSandMaterial = new THREE.MeshLambertMaterial({
         vertexColors: true,
-        // Цвет и детализация рельефа вычисляются в world-space на вершинах,
-        // поэтому на крутых склонах больше нет вытянутой XZ-текстуры.
         flatShading: false
-    }), PS1_SNAP.terrain);
+    });
+    const { material: sandMaterial, uniforms: sandUniforms } = applyDesertSurfaceShader(baseSandMaterial, {
+        snapResolution: PS1_SNAP.terrain,
+        sandMap: sandTexture,
+        detailMap: sandDetailTexture
+    });
+
+    // Инициализируем направление эоловой ряби по господствующему ветру генератора дюн
+    const initialOrient = getDuneOrientation(0, 0);
+    sandUniforms.uWindDir.value.set(initialOrient.cos, initialOrient.sin).normalize();
 
     const skirtMaterial = applyPS1VertexSnap(new THREE.MeshLambertMaterial({
         color: PALETTE.rock,
@@ -62,13 +74,17 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
 
     const propMaterials = {
         rock: applyPS1VertexSnap(new THREE.MeshLambertMaterial({
-            map: createMechTexture(165, 118, 78),
+            map: createRockTexture(168, 120, 80),
             flatShading: true
         }), PS1_SNAP.terrain),
         debris: applyPS1VertexSnap(new THREE.MeshLambertMaterial({
-            map: createMechTexture(135, 95, 65),
+            map: createRockTexture(138, 98, 66),
             flatShading: true
-        }), PS1_SNAP.debris)
+        }), PS1_SNAP.debris),
+        pebble: applyPS1VertexSnap(new THREE.MeshLambertMaterial({
+            map: createRockTexture(178, 136, 94),
+            flatShading: true
+        }), PS1_SNAP.terrain)
     };
 
     const frameGeometry = new THREE.BoxGeometry(
@@ -78,6 +94,7 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
     );
     const rockGeometry = new THREE.DodecahedronGeometry(1.0, 1);
     const debrisGeometry = new THREE.IcosahedronGeometry(1.0, 0);
+    const pebbleGeometry = new THREE.DodecahedronGeometry(0.85, 0);
     const slabGeometry = new THREE.BoxGeometry(1.6, 0.45, 1.6);
     const poleGeometry = new THREE.CylinderGeometry(0.06, 0.08, 2.4, 5);
 
@@ -102,8 +119,8 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
             scene, world, cx, cz,
             materials: propMaterials,
             rockGeometry, debrisGeometry,
-            slabGeometry, poleGeometry,
-            clearZone: { x: focus.x, z: focus.z, radius: CHUNK.propClearRadius },
+            slabGeometry, poleGeometry, pebbleGeometry,
+            clearZone: { x: 0, z: 0, radius: CHUNK.propClearRadius },
             enabled: CHUNK.propsEnabled
         });
 
@@ -168,14 +185,20 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
     }
 
     // focus — позиция меха; budget — сколько чанков достроить в этом кадре;
-    // environment — { dt, weather } из главного цикла (может отсутствовать
-    // при стартовой синхронной подгрузке).
+    // environment — { dt, weather, sunDir } из главного цикла.
     function update(
         nextFocus: THREE.Vector3 | { x: number; y?: number; z: number },
         budget = CHUNK.buildBudget,
         environment: ChunkEnvironment | null = null
     ): void {
         focus.copy(nextFocus as THREE.Vector3);
+
+        // Обновляем направление солнца и ветра в шейдере пустыни
+        const orient = getDuneOrientation(focus.x, focus.z);
+        sandUniforms.uWindDir.value.set(orient.cos, orient.sin).normalize();
+        if (environment?.sunDir) {
+            sandUniforms.uSunDir.value.copy(environment.sunDir).normalize();
+        }
 
         const ccx = chunkCoordAt(focus.x);
         const ccz = chunkCoordAt(focus.z);
@@ -237,8 +260,11 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
             frameGeometry.dispose();
             rockGeometry.dispose();
             debrisGeometry.dispose();
+            pebbleGeometry.dispose();
             slabGeometry.dispose();
             poleGeometry.dispose();
+            sandTexture.dispose();
+            sandDetailTexture.dispose();
             sandMaterial.dispose();
             skirtMaterial.dispose();
             frameMaterial.dispose();
@@ -246,7 +272,8 @@ export function createChunkWorld({ scene, world }: ChunkWorldOptions): ChunkWorl
             propMaterials.rock.dispose();
             if ((propMaterials.debris as any).map) (propMaterials.debris as any).map.dispose();
             propMaterials.debris.dispose();
+            if ((propMaterials.pebble as any).map) (propMaterials.pebble as any).map.dispose();
+            propMaterials.pebble.dispose();
         }
     };
 }
-
