@@ -70,7 +70,7 @@ export interface IActor {
     contextId: string;
     controller: {
         update(dt: number, ctx: unknown): any;
-        onAction?(name: string, phase: string): void;
+        onAction?(name: string, phase: string, repeat?: boolean): void;
         [key: string]: any;
     };
     getPose(): Pose;

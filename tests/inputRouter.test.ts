@@ -91,7 +91,8 @@ test('inputRouter getActions returns snapshot of all active context actions', ()
         left: false,
         right: false,
         stomp: false,
-        jump: false
+        jump: false,
+        toggleLights: false
     });
 
     send('keydown', { code: 'KeyW' });
@@ -103,7 +104,8 @@ test('inputRouter getActions returns snapshot of all active context actions', ()
         left: false,
         right: false,
         stomp: true,
-        jump: false
+        jump: false,
+        toggleLights: false
     });
 });
 

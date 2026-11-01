@@ -20,8 +20,7 @@ export const DEFAULT_BINDINGS: ContextBindings = {
         weatherPreset3: ['Digit3'],
         weatherPreset4: ['Digit4'],
         weatherCycle: ['KeyR'],
-        timeToggle: ['KeyT'],
-        switchActor: ['KeyV']
+        timeToggle: ['KeyT']
     },
     mech: {
         forward: ['KeyW', 'ArrowUp'],
@@ -29,23 +28,36 @@ export const DEFAULT_BINDINGS: ContextBindings = {
         left: ['KeyA', 'ArrowLeft'],
         right: ['KeyD', 'ArrowRight'],
         stomp: ['Space'],
-        jump: ['ShiftLeft', 'ShiftRight']
+        jump: ['ShiftLeft', 'ShiftRight'],
+        toggleLights: ['KeyL']
     },
     cosmo: {
         forward: ['KeyW', 'ArrowUp'],
         backward: ['KeyS', 'ArrowDown'],
         left: ['KeyA', 'ArrowLeft'],
         right: ['KeyD', 'ArrowRight'],
-        crouchDown: ['KeyQ', 'ControlLeft'],
-        crouchUp: ['KeyE'],
+        crouch: ['ControlLeft', 'ControlRight'],
         jump: ['Space'],
         sprint: ['ShiftLeft', 'ShiftRight'],
-        run: ['ShiftLeft', 'ShiftRight']
+        run: ['ShiftLeft', 'ShiftRight'],
+        interact: ['KeyF'],
+        toggleLights: ['KeyL']
+    },
+    transport: {
+        forward: ['KeyW', 'ArrowUp'],
+        backward: ['KeyS', 'ArrowDown'],
+        left: ['KeyA', 'ArrowLeft'],
+        right: ['KeyD', 'ArrowRight'],
+        boost: ['ShiftLeft', 'ShiftRight'],
+        brake: ['Space'],
+        interact: ['KeyF', 'KeyE'],
+        toggleLights: ['KeyL']
     }
 };
 
-// character как синоним cosmo для расширяемости
+// Синонимы контекстов для расширяемости
 DEFAULT_BINDINGS.character = DEFAULT_BINDINGS.cosmo;
+DEFAULT_BINDINGS.buggy = DEFAULT_BINDINGS.transport;
 
 export const PREVENT_DEFAULT_KEYS: string[] = [
     'ArrowUp',

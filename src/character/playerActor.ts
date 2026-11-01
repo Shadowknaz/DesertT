@@ -177,10 +177,10 @@ export function createPlayerActor({
 
                 if (!isSolidSurface(lSample.surfaceType, lSample.materialId)) {
                     if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(lf.position, 3, 0.45);
+                        dust.spawnSplash(lf.position, 4, 0.34);
                     }
                     if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        granules.spawnFootEjection(lf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                        granules.spawnFootEjection(lf.position, _landingEjectVel, 6, 0.34, withdrawMassFn);
                     }
                     const lResp = computeFootprintResponse(
                         footprintDepth * 1.3,
@@ -194,10 +194,10 @@ export function createPlayerActor({
 
                 if (!isSolidSurface(rSample.surfaceType, rSample.materialId)) {
                     if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(rf.position, 3, 0.45);
+                        dust.spawnSplash(rf.position, 4, 0.34);
                     }
                     if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        granules.spawnFootEjection(rf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                        granules.spawnFootEjection(rf.position, _landingEjectVel, 6, 0.34, withdrawMassFn);
                     }
                     const rResp = computeFootprintResponse(
                         footprintDepth * 1.3,
@@ -213,16 +213,16 @@ export function createPlayerActor({
                 if (!isSolidSurface(lSample.surfaceType, lSample.materialId)) {
                     const isSprint = ev.isSprinting || Boolean(state.isSprinting);
                     if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(lf.position, isSprint ? 4 : 2, isSprint ? 0.55 : 0.35);
+                        dust.spawnSplash(lf.position, isSprint ? 5 : 3, isSprint ? 0.38 : 0.26);
                     }
                     if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        const ejectMult = isSprint ? 2.2 : 1.5;
-                        _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                        const ejectMult = isSprint ? 2.0 : 1.35;
+                        _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.35, -Math.cos(state.yaw) * ejectMult);
                         granules.spawnFootEjection(
                             lf.position,
                             _ejectVel,
-                            isSprint ? 6 : 4,
-                            isSprint ? 0.5 : 0.35,
+                            isSprint ? 8 : 5,
+                            isSprint ? 0.40 : 0.28,
                             withdrawMassFn
                         );
                     }
@@ -236,16 +236,16 @@ export function createPlayerActor({
                 if (!isSolidSurface(rSample.surfaceType, rSample.materialId)) {
                     const isSprint = ev.isSprinting || Boolean(state.isSprinting);
                     if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(rf.position, isSprint ? 4 : 2, isSprint ? 0.55 : 0.35);
+                        dust.spawnSplash(rf.position, isSprint ? 5 : 3, isSprint ? 0.38 : 0.26);
                     }
                     if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        const ejectMult = isSprint ? 2.2 : 1.5;
-                        _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                        const ejectMult = isSprint ? 2.0 : 1.35;
+                        _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.35, -Math.cos(state.yaw) * ejectMult);
                         granules.spawnFootEjection(
                             rf.position,
                             _ejectVel,
-                            isSprint ? 6 : 4,
-                            isSprint ? 0.5 : 0.35,
+                            isSprint ? 8 : 5,
+                            isSprint ? 0.40 : 0.28,
                             withdrawMassFn
                         );
                     }
@@ -259,21 +259,21 @@ export function createPlayerActor({
                 const rSample = resolveEventGround(rf.position.x, rf.position.z, ev.rightGround || ev.ground);
                 if (!isSolidSurface(lSample.surfaceType, lSample.materialId)) {
                     if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(lf.position, 1, 0.20);
+                        dust.spawnSplash(lf.position, 2, 0.20);
                     }
                     if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        _ejectVel.set(-Math.sin(state.yaw) * 2.2, 0.5, -Math.cos(state.yaw) * 2.2);
-                        granules.spawnFootEjection(lf.position, _ejectVel, 2, 0.25, withdrawMassFn);
+                        _ejectVel.set(-Math.sin(state.yaw) * 2.0, 0.4, -Math.cos(state.yaw) * 2.0);
+                        granules.spawnFootEjection(lf.position, _ejectVel, 3, 0.24, withdrawMassFn);
                     }
                     stampFoot(lf, 0.022, 0.10, state.yaw, lSample);
                 }
                 if (!isSolidSurface(rSample.surfaceType, rSample.materialId)) {
                     if (dust && typeof dust.spawnSplash === 'function') {
-                        dust.spawnSplash(rf.position, 1, 0.20);
+                        dust.spawnSplash(rf.position, 2, 0.20);
                     }
                     if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                        _ejectVel.set(-Math.sin(state.yaw) * 2.2, 0.5, -Math.cos(state.yaw) * 2.2);
-                        granules.spawnFootEjection(rf.position, _ejectVel, 2, 0.25, withdrawMassFn);
+                        _ejectVel.set(-Math.sin(state.yaw) * 2.0, 0.4, -Math.cos(state.yaw) * 2.0);
+                        granules.spawnFootEjection(rf.position, _ejectVel, 3, 0.24, withdrawMassFn);
                     }
                     stampFoot(rf, 0.022, 0.10, state.yaw, rSample);
                 }
@@ -298,6 +298,9 @@ export function createPlayerActor({
             return result;
         },
         syncVisuals(alpha = 1.0) {
+            if (typeof (model as any).isSeated === 'function' && (model as any).isSeated()) {
+                return;
+            }
             const state: PlayerVisualState = typeof controller.getState === 'function'
                 ? controller.getState(alpha)
                 : {
@@ -397,12 +400,12 @@ export function createPlayerActor({
                 if (!prevGrounded && curGrounded) {
                     if (!isSolidSurface(lf.surfaceType, lf.materialId)) {
                         if (dust && typeof dust.spawnSplash === 'function') {
-                            dust.spawnSplash(lf.position, 3, 0.45);
-                            dust.spawnSplash(rf.position, 3, 0.45);
+                            dust.spawnSplash(lf.position, 4, 0.34);
+                            dust.spawnSplash(rf.position, 4, 0.34);
                         }
                         if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                            granules.spawnFootEjection(lf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
-                            granules.spawnFootEjection(rf.position, _landingEjectVel, 4, 0.4, withdrawMassFn);
+                            granules.spawnFootEjection(lf.position, _landingEjectVel, 6, 0.34, withdrawMassFn);
+                            granules.spawnFootEjection(rf.position, _landingEjectVel, 6, 0.34, withdrawMassFn);
                         }
                         stampFoot(lf, footprintDepth * 1.3, 0.16, state.yaw);
                         stampFoot(rf, footprintDepth * 1.3, 0.16, state.yaw);
@@ -418,16 +421,16 @@ export function createPlayerActor({
                     if (prevLeftLift > 0 && curLeftLift === 0) {
                         if (!isSolidSurface(lf.surfaceType, lf.materialId)) {
                             if (dust && typeof dust.spawnSplash === 'function') {
-                                dust.spawnSplash(lf.position, isSprinting ? 4 : 2, isSprinting ? 0.55 : 0.35);
+                                dust.spawnSplash(lf.position, isSprinting ? 5 : 3, isSprinting ? 0.38 : 0.26);
                             }
                             if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                                const ejectMult = isSprinting ? 2.2 : 1.5;
-                                _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                                const ejectMult = isSprinting ? 2.0 : 1.35;
+                                _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.35, -Math.cos(state.yaw) * ejectMult);
                                 granules.spawnFootEjection(
                                     lf.position,
                                     _ejectVel,
-                                    isSprinting ? 6 : 4,
-                                    isSprinting ? 0.5 : 0.35,
+                                    isSprinting ? 8 : 5,
+                                    isSprinting ? 0.40 : 0.28,
                                     withdrawMassFn
                                 );
                             }
@@ -439,16 +442,16 @@ export function createPlayerActor({
                     if (prevRightLift > 0 && curRightLift === 0) {
                         if (!isSolidSurface(rf.surfaceType, rf.materialId)) {
                             if (dust && typeof dust.spawnSplash === 'function') {
-                                dust.spawnSplash(rf.position, isSprinting ? 4 : 2, isSprinting ? 0.55 : 0.35);
+                                dust.spawnSplash(rf.position, isSprinting ? 5 : 3, isSprinting ? 0.38 : 0.26);
                             }
                             if (granules && typeof granules.spawnFootEjection === 'function' && boundSandField) {
-                                const ejectMult = isSprinting ? 2.2 : 1.5;
-                                _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.4, -Math.cos(state.yaw) * ejectMult);
+                                const ejectMult = isSprinting ? 2.0 : 1.35;
+                                _ejectVel.set(-Math.sin(state.yaw) * ejectMult, 0.35, -Math.cos(state.yaw) * ejectMult);
                                 granules.spawnFootEjection(
                                     rf.position,
                                     _ejectVel,
-                                    isSprinting ? 6 : 4,
-                                    isSprinting ? 0.5 : 0.35,
+                                    isSprinting ? 8 : 5,
+                                    isSprinting ? 0.40 : 0.28,
                                     withdrawMassFn
                                 );
                             }
@@ -472,8 +475,9 @@ export function createPlayerActor({
             if (!syncSand && chunks?.syncSandAt) {
                 syncSand = chunks.syncSandAt;
             }
-            if (dust && typeof dust.updateAmbient === 'function') {
-                dust.updateAmbient(motion.bodyPos, frameDt, weatherState);
+            const focusPos = motion?.bodyPos || motion?.position || controller.getPose().position;
+            if (dust && typeof dust.updateAmbient === 'function' && focusPos) {
+                dust.updateAmbient(focusPos, frameDt, weatherState);
             }
             if (granules && typeof granules.update === 'function' && chunks?.sandField) {
                 currentChunks = chunks;

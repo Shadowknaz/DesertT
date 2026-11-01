@@ -44,13 +44,13 @@ export interface GroundSamplerOptions {
 }
 
 export interface GroundSampler {
-    sample(x: number, z: number): GroundSamplerResult;
+    sample(x: number, z: number, referenceY?: number): GroundSamplerResult;
     ignoreBody(bodyOrHandle: RAPIER.RigidBody | number | { handle: number } | any): void;
 }
 
 const DEFAULT_SAND_MAX_ANGLE = 40 * Math.PI / 180;
 const DEFAULT_PACKED_BONUS_RAD = 5 * Math.PI / 180;
-const DEFAULT_SOLID_MAX_ANGLE = COSMO.maxSlopeClimbAngle ?? (45 * Math.PI / 180);
+const DEFAULT_SOLID_MAX_ANGLE = Math.max(COSMO.maxSlopeClimbAngle ?? 0, 58 * Math.PI / 180);
 
 export function computeMaxContactAngle(
     surfaceType: 'sand' | 'solid' | string,
@@ -101,9 +101,9 @@ export function copyGroundSample(
     return target as GroundSamplerResult;
 }
 
-function rawHeightFromQuery(groundAt: any, x: number, z: number, fallbackY = 0): number {
+function rawHeightFromQuery(groundAt: any, x: number, z: number, fallbackY = 0, referenceY?: number): number {
     if (typeof groundAt !== 'function') return fallbackY;
-    const s = groundAt(x, z);
+    const s = groundAt(x, z, referenceY);
     if (typeof s === 'number') return Number.isFinite(s) ? s : fallbackY;
     if (s && typeof s.y === 'number' && Number.isFinite(s.y)) return s.y;
     return fallbackY;
@@ -118,7 +118,8 @@ export function resolveGroundSample(
     x: number,
     z: number,
     out: GroundSample = createDefaultGroundSample(),
-    computeMissingNormal = true
+    computeMissingNormal = true,
+    referenceY?: number
 ): GroundSample {
     if (typeof groundAt !== 'function') {
         out.y = 0;
@@ -136,7 +137,7 @@ export function resolveGroundSample(
         return out;
     }
 
-    const raw = groundAt(x, z);
+    const raw = groundAt(x, z, referenceY);
     if (typeof raw === 'number') {
         out.y = Number.isFinite(raw) ? raw : 0;
         out.surfaceType = 'sand';
@@ -151,10 +152,10 @@ export function resolveGroundSample(
         out.maxContactAngle = computeMaxContactAngle('sand', 'loose_sand', 0);
         if (computeMissingNormal) {
             const eps = 0.30;
-            const hXP = rawHeightFromQuery(groundAt, x + eps, z, out.y);
-            const hXN = rawHeightFromQuery(groundAt, x - eps, z, out.y);
-            const hZP = rawHeightFromQuery(groundAt, x, z + eps, out.y);
-            const hZN = rawHeightFromQuery(groundAt, x, z - eps, out.y);
+            const hXP = rawHeightFromQuery(groundAt, x + eps, z, out.y, referenceY);
+            const hXN = rawHeightFromQuery(groundAt, x - eps, z, out.y, referenceY);
+            const hZP = rawHeightFromQuery(groundAt, x, z + eps, out.y, referenceY);
+            const hZN = rawHeightFromQuery(groundAt, x, z - eps, out.y, referenceY);
             const nx = (hXN - hXP) / (2 * eps);
             const nz = (hZN - hZP) / (2 * eps);
             out.normal.set(nx, 1.0, nz).normalize();
@@ -198,10 +199,10 @@ export function resolveGroundSample(
             }
         } else if (computeMissingNormal) {
             const eps = 0.30;
-            const hXP = rawHeightFromQuery(groundAt, x + eps, z, out.y);
-            const hXN = rawHeightFromQuery(groundAt, x - eps, z, out.y);
-            const hZP = rawHeightFromQuery(groundAt, x, z + eps, out.y);
-            const hZN = rawHeightFromQuery(groundAt, x, z - eps, out.y);
+            const hXP = rawHeightFromQuery(groundAt, x + eps, z, out.y, referenceY);
+            const hXN = rawHeightFromQuery(groundAt, x - eps, z, out.y, referenceY);
+            const hZP = rawHeightFromQuery(groundAt, x, z + eps, out.y, referenceY);
+            const hZN = rawHeightFromQuery(groundAt, x, z - eps, out.y, referenceY);
             const nx = (hXN - hXP) / (2 * eps);
             const nz = (hZN - hZP) / (2 * eps);
             out.normal.set(nx, 1.0, nz).normalize();
@@ -253,40 +254,45 @@ export function sampleCharacterGroundProbes(
     rightX: number,
     rightZ: number,
     config: Partial<typeof COSMO> = COSMO,
-    out: CharacterGroundProbes = createCharacterGroundProbes()
+    out: CharacterGroundProbes = createCharacterGroundProbes(),
+    referenceY?: number
 ): CharacterGroundProbes {
     const footOffset = config.probeFootOffsetX ?? COSMO.probeFootOffsetX ?? 0.19;
     const aheadDist = config.probeAheadDistance ?? COSMO.probeAheadDistance ?? 0.42;
     const behindDist = config.probeBehindDistance ?? COSMO.probeBehindDistance ?? 0.36;
 
-    resolveGroundSample(groundAt, x, z, out.center, true);
+    resolveGroundSample(groundAt, x, z, out.center, true, referenceY);
     resolveGroundSample(
         groundAt,
         x - rightX * footOffset,
         z - rightZ * footOffset,
         out.leftFoot,
-        true
+        true,
+        referenceY
     );
     resolveGroundSample(
         groundAt,
         x + rightX * footOffset,
         z + rightZ * footOffset,
         out.rightFoot,
-        true
+        true,
+        referenceY
     );
     resolveGroundSample(
         groundAt,
         x + dirX * aheadDist,
         z + dirZ * aheadDist,
         out.ahead,
-        false
+        false,
+        referenceY
     );
     resolveGroundSample(
         groundAt,
         x - dirX * behindDist,
         z - dirZ * behindDist,
         out.behind,
-        false
+        false,
+        referenceY
     );
 
     return out;
@@ -342,9 +348,13 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
         return result;
     }
 
-    function sample(x: number, z: number): GroundSamplerResult {
+    function sample(x: number, z: number, referenceY?: number): GroundSamplerResult {
+        const useRefY = typeof referenceY === 'number' && Number.isFinite(referenceY);
         ray.origin.x = x;
+        ray.origin.y = useRefY ? referenceY + 1.45 : TERRAIN.probeOriginY;
         ray.origin.z = z;
+        const wallHandles: Set<number> | undefined = (world as any).__wallColliderHandles;
+
         const hit = world.castRayAndGetNormal(
             ray,
             TERRAIN.probeRange,
@@ -354,6 +364,8 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
             undefined,
             bodies[0],
             (collider: any) => {
+                if (wallHandles && wallHandles.has(collider.handle)) return false;
+                if (typeof collider.isSensor === 'function' && collider.isSensor()) return false;
                 const parent = collider.parent();
                 if (parent && ignored.has(parent.handle)) return false;
                 // Капсульные коллайдеры принадлежат управляемым персонажам и не являются поверхностью грунта
@@ -362,7 +374,7 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
             }
         );
 
-        if (hit && hit.toi > 0.1) {
+        if (hit && hit.toi > 0.05) {
             const collider = hit.collider;
             if (collider.shape.type === RAPIER.ShapeType.HeightField) {
                 return sampleSand(x, z, collider.handle);
@@ -380,7 +392,7 @@ export function createGroundSampler({ world, mechBodies, ignoredBodyHandles, san
             result.maxContactAngle = computeMaxContactAngle('solid', 'stone', 0);
 
             baseNormal.set(hit.normal.x, hit.normal.y, hit.normal.z);
-            if (baseNormal.y < 0.5) baseNormal.set(0, 1, 0);
+            if (baseNormal.y < 0.35) baseNormal.set(0, 1, 0);
             result.normal.copy(baseNormal.normalize());
             return result;
         }

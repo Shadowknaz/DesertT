@@ -816,6 +816,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
   const _candGroundSample = createDefaultGroundSample();
 
   let smoothPelvisDrop = 0;
+  let smoothBrakeDrop = 0;
   let smoothSupportPitch = 0;
   let smoothSupportRoll = 0;
   let smoothComShiftX = 0;
@@ -1001,6 +1002,9 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     dst.maxContactAngle = src.maxContactAngle;
   }
 
+  let currentSeatedPose: any = null;
+  const CLAW_GRIP_OFFSET = 0.085;
+
   const robotRig = {
     // Корневой контейнер всего рига
     group: rigRootGroup,
@@ -1012,7 +1016,8 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       SHIN_LEN,
       FOOT_HEIGHT,
       UPPER_ARM_LEN,
-      FOREARM_LEN
+      FOREARM_LEN,
+      CLAW_GRIP_OFFSET
     },
 
     // Прямой доступ к узлам скелета
@@ -1053,6 +1058,18 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       crossSlopeAngle: 0,
       forwardAccel: 0,
       grounded: true
+    },
+
+    setSeatedPose(pose: any = null) {
+      currentSeatedPose = pose;
+    },
+
+    isSeated(): boolean {
+      return currentSeatedPose !== null;
+    },
+
+    getSeatedPose(): any {
+      return currentSeatedPose;
     },
 
     setLocomotion({
@@ -1139,6 +1156,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
 
     // Сброс всех IK-целей в базовую стойку относительно текущих rootPosition и rootYaw
     resetTargetsToStance() {
+      if (currentSeatedPose) return;
       const sinY = Math.sin(this.pose.rootYaw);
       const cosY = Math.cos(this.pose.rootYaw);
       _forwardWorld.set(sinY, 0, cosY);
@@ -1172,6 +1190,7 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
     // Сброс темпоральных рэгдолл-сглаживателей при телепортации или респавне
     resetSmoothing() {
       smoothPelvisDrop = 0;
+      smoothBrakeDrop = 0;
       smoothSupportPitch = 0;
       smoothSupportRoll = 0;
       smoothComShiftX = 0;
@@ -1204,6 +1223,116 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
 
     // Вызывайте один раз за кадр после обновления pose и ikTargets
     update(groundAt: ((x: number, z: number) => any) | null = null) {
+      if (currentSeatedPose) {
+        // === РЕЖИМ ПОСАДКИ НА ТРАНСПОРТНОМ СРЕДСТВЕ (SEATED VEHICLE IK) ===
+        suitRoot.position.copy(currentSeatedPose.seatPosition);
+        suitRoot.quaternion.copy(currentSeatedPose.seatQuaternion);
+
+        pelvisGroup.position.set(0, 0, 0);
+        pelvisGroup.rotation.set(
+          currentSeatedPose.pelvisPitch || 0,
+          currentSeatedPose.pelvisYaw || 0,
+          currentSeatedPose.pelvisRoll || 0
+        );
+
+        torsoGroup.rotation.set(
+          currentSeatedPose.torsoPitch || 0,
+          currentSeatedPose.torsoYaw || 0,
+          currentSeatedPose.torsoRoll || 0
+        );
+
+        headGroup.rotation.set(
+          currentSeatedPose.headPitch || 0,
+          currentSeatedPose.headYaw || 0,
+          currentSeatedPose.headRoll || 0
+        );
+
+        suitRoot.updateMatrixWorld(true);
+
+        this.ikTargets.leftFoot.position.copy(currentSeatedPose.leftFootPosition);
+        this.ikTargets.rightFoot.position.copy(currentSeatedPose.rightFootPosition);
+        this.ikTargets.leftHand.position.copy(currentSeatedPose.leftHandPosition);
+        this.ikTargets.rightHand.position.copy(currentSeatedPose.rightHandPosition);
+
+        const cRight = currentSeatedPose.chassisRight || _rightWorld.set(1, 0, 0);
+        const cUp = currentSeatedPose.chassisUp || _vUp;
+        const cFwd = currentSeatedPose.chassisForward || _forwardWorld.set(0, 0, 1);
+
+        // Ноги на подножках мотоцикла: колени направлены вперед и слегка наружу вокруг топливного бака
+        for (let i = 0; i < 2; i++) {
+          const isLeft = i === 0;
+          const leg = isLeft ? leftLeg : rightLeg;
+          const target = isLeft ? this.ikTargets.leftFoot : this.ikTargets.rightFoot;
+          const footQuat = isLeft ? currentSeatedPose.leftFootQuaternion : currentSeatedPose.rightFootQuaternion;
+
+          leg.footGroup.position.copy(target.position);
+          leg.footGroup.quaternion.copy(footQuat);
+
+          _ankleWorldTarget.copy(target.position).addScaledVector(cUp, FOOT_HEIGHT);
+          leg.ankleTarget.copy(_ankleWorldTarget);
+
+          leg.hipMount.getWorldPosition(_hipWorldPos);
+
+          _legPoleWorld.copy(cFwd)
+            .multiplyScalar(1.0)
+            .addScaledVector(cRight, leg.sideSign * 0.34)
+            .normalize();
+
+          solveTwoBoneIK(
+            _hipWorldPos,
+            _ankleWorldTarget,
+            _legPoleWorld,
+            THIGH_LEN,
+            SHIN_LEN,
+            leg.thighBone,
+            leg.shinBone,
+            cRight
+          );
+        }
+
+        // Руки на рукоятках руля: центр трехпалой клешни (FOREARM_LEN + CLAW_GRIP_OFFSET)
+        // ложится точно на мировую ось резиновых грипс руля.
+        for (let i = 0; i < 2; i++) {
+          const isLeft = i === 0;
+          const arm = isLeft ? leftArm : rightArm;
+          const target = isLeft ? this.ikTargets.leftHand : this.ikTargets.rightHand;
+
+          arm.shoulderMount.getWorldPosition(_shoulderWorldPos);
+          arm.wristTarget.copy(target.position);
+
+          _armPoleWorld.copy(cFwd)
+            .multiplyScalar(-0.70)
+            .addScaledVector(cRight, arm.sideSign * 0.65)
+            .addScaledVector(cUp, -0.35)
+            .normalize();
+
+          solveTwoBoneIK(
+            _shoulderWorldPos,
+            target.position,
+            _armPoleWorld,
+            UPPER_ARM_LEN,
+            FOREARM_LEN + CLAW_GRIP_OFFSET,
+            arm.upperArmBone,
+            arm.forearmBone,
+            cRight
+          );
+        }
+
+        leftLeg.thighBone.updateMatrixWorld(true);
+        leftLeg.shinBone.updateMatrixWorld(true);
+        leftLeg.footGroup.updateMatrixWorld(true);
+        rightLeg.thighBone.updateMatrixWorld(true);
+        rightLeg.shinBone.updateMatrixWorld(true);
+        rightLeg.footGroup.updateMatrixWorld(true);
+        leftArm.upperArmBone.updateMatrixWorld(true);
+        leftArm.forearmBone.updateMatrixWorld(true);
+        rightArm.upperArmBone.updateMatrixWorld(true);
+        rightArm.forearmBone.updateMatrixWorld(true);
+
+        updateAllHydraulicPistons();
+        return;
+      }
+
       sanitizeVector3(this.pose.rootPosition, 0, 0, 0);
       if (!Number.isFinite(this.pose.rootYaw)) this.pose.rootYaw = 0;
 
@@ -1440,13 +1569,17 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
                 target.maxContactAngle = stGround.sample.maxContactAngle;
               }
 
-              target.groundY = stGround.sample.y;
-              target.position.y = stGround.sample.y;
+              const maxLedgeDrop = COSMO.maxStepHeightDelta ?? 0.38;
+              const clampedStGroundY = (!this.locomotion.grounded || (this.pose.rootPosition.y - stGround.sample.y) > maxLedgeDrop)
+                ? Math.max(stGround.sample.y, this.pose.rootPosition.y - 0.22)
+                : stGround.sample.y;
+              target.groundY = clampedStGroundY;
+              target.position.y = clampedStGroundY;
               target.groundGap = 0;
               target.state = 'stance';
               target.foothold.copy(target.position);
               target.footholdSafe = true;
-              mem.lockedWorldPos.y = stGround.sample.y;
+              mem.lockedWorldPos.y = clampedStGroundY;
             }
           } else {
             // Покой (idle stance): проверяем поверхность под стопой
@@ -1464,8 +1597,12 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
             }
             // Если внешняя система выставила target.position.y вручную без groundAt (как в тесте Soft IK), сохраняем его
             if (typeof groundAt === 'function') {
-              target.groundY = idleGround.sample.y;
-              target.position.y = idleGround.sample.y;
+              const maxLedgeDrop = COSMO.maxStepHeightDelta ?? 0.38;
+              const clampedIdleY = (!this.locomotion.grounded || (this.pose.rootPosition.y - idleGround.sample.y) > maxLedgeDrop)
+                ? Math.max(idleGround.sample.y, this.pose.rootPosition.y - 0.22)
+                : idleGround.sample.y;
+              target.groundY = clampedIdleY;
+              target.position.y = clampedIdleY;
             } else {
               target.groundY = target.position.y;
             }
@@ -1490,11 +1627,16 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       const rw = THREE.MathUtils.clamp(rf.contactWeight ?? 1.0, 0, 1);
       const totalWeight = lw + rw;
 
-      const leftGround = lf.groundY ?? lf.position.y;
-      const rightGround = rf.groundY ?? rf.position.y;
+      const rootY = this.pose.rootPosition.y;
+      const maxPelvisSlopeSpan = 0.24;
+      const leftGround = this.locomotion.grounded
+        ? THREE.MathUtils.clamp(lf.groundY ?? lf.position.y, rootY - maxPelvisSlopeSpan, rootY + maxPelvisSlopeSpan)
+        : rootY;
+      const rightGround = this.locomotion.grounded
+        ? THREE.MathUtils.clamp(rf.groundY ?? rf.position.y, rootY - maxPelvisSlopeSpan, rootY + maxPelvisSlopeSpan)
+        : rootY;
       const minTerrainY = Math.min(leftGround, rightGround);
       const maxTerrainY = Math.max(leftGround, rightGround);
-      const rootY = this.pose.rootPosition.y;
 
       // Боковой перенос центра тяжести к подтвержденной опорной ноге
       const weightImbalance = totalWeight > 0.05 ? (rw - lw) / totalWeight : 0;
@@ -1540,11 +1682,32 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       smoothSupportPitch += (targetSupportPitch - smoothSupportPitch) * pelvisRate;
       smoothSupportRoll += (targetSupportRoll - smoothSupportRoll) * pelvisRate;
 
+      // Наклон корпуса и подседание таза (амортизация коленями) при разгоне/торможении (85 кг)
+      const fwdAccel = this.locomotion.forwardAccel || 0;
+      const targetAccelPitch = THREE.MathUtils.clamp(
+        fwdAccel * (COSMO.accelTorsoLeanGain ?? 0.22) * 0.14,
+        -0.18,
+        0.20
+      );
+      const targetBrakeDrop = fwdAccel < -0.2
+        ? THREE.MathUtils.clamp(-fwdAccel * 0.0065, 0, COSMO.brakePelvisDropMax ?? 0.055)
+        : (fwdAccel > 0.5 ? THREE.MathUtils.clamp(fwdAccel * 0.0022, 0, 0.022) : 0);
+      const targetCrossRoll = THREE.MathUtils.clamp(
+        -smoothSupportRoll * (COSMO.crossSlopeTorsoGain ?? 0.28),
+        -0.14,
+        0.14
+      );
+      smoothAccelPitch += (targetAccelPitch - smoothAccelPitch) * torsoRate;
+      smoothBrakeDrop += (targetBrakeDrop - smoothBrakeDrop) * pelvisRate;
+      smoothCrossSlopeRoll += (targetCrossRoll - smoothCrossSlopeRoll) * torsoRate;
+
       // Биомеханика таза и торса (покачивание, боковой перенос массы, наклон)
       const bobY = isSliding ? 0 : (-Math.cos(phase * 2.0) * 0.022 * amount);
       const swayX = isSliding ? 0 : (-Math.sin(phase) * 0.024 * amount + smoothComShiftX * 0.35);
       const rollZ = isSliding ? -0.05 : (Math.sin(phase) * 0.035 * amount + smoothSupportRoll);
-      const pitchX = isSliding ? -0.12 : ((isSprinting ? 0.055 : 0.035) * amount + smoothSupportPitch);
+      const pitchX = isSliding
+        ? -0.12
+        : ((isSprinting ? 0.055 : 0.035) * amount + smoothSupportPitch + smoothAccelPitch * 0.32);
       const yawY = isSliding ? 0.22 : (-Math.sin(phase) * 0.045 * amount);
 
       // Снижение центра массы таза при спринте (ровно 0.045 * amount на плоской поверхности)
@@ -1556,18 +1719,21 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
       const downhillFlex = (this.locomotion.downhillAngle || 0) > 0.02
         ? Math.min(0.06, (this.locomotion.downhillAngle || 0) * 0.09)
         : 0;
-      const targetPelvisDrop = Math.min(0, (minTerrainY - rootY) * 0.55) - unevenness * 0.22 - downhillFlex;
+      const rawPelvisDrop = this.locomotion.grounded
+        ? (Math.min(0, (minTerrainY - rootY) * 0.55) - unevenness * 0.22 - downhillFlex)
+        : 0;
+      const targetPelvisDrop = THREE.MathUtils.clamp(rawPelvisDrop, -0.14, 0);
       smoothPelvisDrop += (targetPelvisDrop - smoothPelvisDrop) * pelvisRate;
 
       // Физический корень костюма строго совпадает с rootPosition (без расхождения с коллайдером)
       suitRoot.position.copy(this.pose.rootPosition);
-      suitRoot.rotation.y = this.pose.rootYaw;
+      suitRoot.rotation.set(0, this.pose.rootYaw, 0);
 
       const bankRoll = this.locomotion.bankingRoll || 0;
 
       pelvisGroup.position.set(
         this.pose.pelvisOffset.x + swayX,
-        BASE_PELVIS_Y + this.pose.pelvisOffset.y + bobY + smoothPelvisDrop - runPelvisDrop,
+        BASE_PELVIS_Y + this.pose.pelvisOffset.y + bobY + smoothPelvisDrop - runPelvisDrop - smoothBrakeDrop,
         this.pose.pelvisOffset.z
       );
       pelvisGroup.rotation.set(
@@ -1575,20 +1741,6 @@ export function createPlayerModel({ scene, scale = 1 }: { scene: THREE.Scene; sc
         this.pose.pelvisRotation.y + yawY,
         this.pose.pelvisRotation.z + rollZ + bankRoll
       );
-
-      // Наклон корпуса при разгоне/торможении и компенсация поперечного уклона
-      const targetAccelPitch = THREE.MathUtils.clamp(
-        (this.locomotion.forwardAccel || 0) * (COSMO.accelTorsoLeanGain ?? 0.08) * 0.15,
-        -0.12,
-        0.14
-      );
-      const targetCrossRoll = THREE.MathUtils.clamp(
-        -smoothSupportRoll * (COSMO.crossSlopeTorsoGain ?? 0.28),
-        -0.14,
-        0.14
-      );
-      smoothAccelPitch += (targetAccelPitch - smoothAccelPitch) * torsoRate;
-      smoothCrossSlopeRoll += (targetCrossRoll - smoothCrossSlopeRoll) * torsoRate;
 
       const torsoTwistYaw = isSliding ? -0.18 : (Math.sin(phase) * 0.065 * amount);
       const torsoLeanPitch = isSliding

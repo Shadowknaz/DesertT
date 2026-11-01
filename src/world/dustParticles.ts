@@ -35,7 +35,9 @@ export interface DustSystem {
 
 export function createDustSystem({ scene, windAt = null, rng = null }: DustSystemOptions): DustSystem {
     const rnd = rng ? () => rng.next() : () => Math.random();
-    const particleGeometry = new THREE.BoxGeometry(0.28, 0.28, 0.28);
+    // Мелкая гранула пыли (7.5 см вместо 28 см), чтобы выбросы из-под ног и колёс
+    // выглядели рассыпчатым песком, а не крупными кубиками.
+    const particleGeometry = new THREE.BoxGeometry(0.075, 0.075, 0.075);
     const particleMaterial = applyPS1VertexSnap(new THREE.MeshLambertMaterial({
         color: PALETTE.sandParticle,
         flatShading: true
@@ -52,6 +54,8 @@ export function createDustSystem({ scene, windAt = null, rng = null }: DustSyste
     const dummyObj = new THREE.Object3D();
     const wind = new THREE.Vector3();
     const jitter = new THREE.Vector3();
+    const tintColor = new THREE.Color();
+    const sandTints = [0xdca86e, 0xe7b982, 0xc9945c, 0xf0c996, 0xd39e65];
     let ambientAccumulator = 0.0;
     let activeCount = 0;
 
@@ -68,7 +72,10 @@ export function createDustSystem({ scene, windAt = null, rng = null }: DustSyste
         dummyObj.scale.setScalar(0.001);
         dummyObj.updateMatrix();
         instanced.setMatrixAt(i, dummyObj.matrix);
+        tintColor.setHex(sandTints[i % sandTints.length]);
+        instanced.setColorAt(i, tintColor);
     }
+    if (instanced.instanceColor) instanced.instanceColor.needsUpdate = true;
 
     function sampleWindAt(x: number, z: number): THREE.Vector3 | null {
         if (!windAt) return null;

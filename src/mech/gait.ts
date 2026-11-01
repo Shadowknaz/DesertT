@@ -211,8 +211,8 @@ export function createGaitController({
         sandField.land(leg.currentFootPos.x, leg.currentFootPos.z,
             SAND.stepFootprintRadius, impactSpeed, load, _soleOptions);
         syncSandAt(leg.currentFootPos.x, leg.currentFootPos.z, SAND.stepFootprintRadius * 1.3);
-        dust.spawnSplash(leg.currentFootPos, dustCount, dustIntensity);
-        if (granules) granules.spawnFootEjection(leg.currentFootPos, leg.slipVelocity, 12, 0.95);
+        dust.spawnSplash(leg.currentFootPos, dustCount, dustIntensity * 0.72);
+        if (granules) granules.spawnFootEjection(leg.currentFootPos, leg.slipVelocity, 16, 0.68);
     }
 
     // Опорные лапы держат корпус, качающиеся — нет. Вес им больше не
@@ -291,7 +291,7 @@ export function createGaitController({
             );
             leg.sinkRate = contact.sinkRate;
             if (granules && leg.slip > 0.08) {
-                granules.spawnFootEjection(leg.currentFootPos, leg.slipVelocity, 6, 0.75);
+                granules.spawnFootEjection(leg.currentFootPos, leg.slipVelocity, 8, 0.56);
             }
         }
         // A later footprint can change packing beneath an earlier one. Keep

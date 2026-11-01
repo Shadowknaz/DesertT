@@ -77,8 +77,9 @@ export function createSandGranules({
     let totalReserveVolume = 0.0;
     let lastStepDurationMs = 0.0;
 
-    // Геометрия зерна песка: низкополигональный кубик в духе PS1
-    const granuleGeom = new THREE.BoxGeometry(0.18, 0.18, 0.18);
+    // Геометрия зерна песка: мелкая крупинка в духе PS1 (4.8 см вместо 18 см),
+    // чтобы струи из-под лап меха, стоп Cosmo и колеса мотоцикла читались как песок.
+    const granuleGeom = new THREE.BoxGeometry(0.048, 0.048, 0.048);
     const granuleMat = applyPS1VertexSnap(new THREE.MeshLambertMaterial({
         color: PALETTE.sandParticle,
         flatShading: true
@@ -103,14 +104,19 @@ export function createSandGranules({
     const active = new Uint8Array(MAX_GRANULES);
 
     const dummy = new THREE.Object3D();
+    const grainColor = new THREE.Color();
+    const grainPalette = [0xdca86e, 0xe8bc84, 0xc79258, 0xf2ce9c, 0xd19a61];
     dummy.position.set(0, -999, 0);
     dummy.scale.setScalar(0.001);
     dummy.updateMatrix();
     for (let i = 0; i < MAX_GRANULES; i++) {
         instanced.setMatrixAt(i, dummy.matrix);
+        grainColor.setHex(grainPalette[i % grainPalette.length]);
+        instanced.setColorAt(i, grainColor);
         posY[i] = -999;
     }
     instanced.instanceMatrix.needsUpdate = true;
+    if (instanced.instanceColor) instanced.instanceColor.needsUpdate = true;
 
     let activeCount = 0;
     let spawnCursor = 0;
@@ -176,22 +182,22 @@ export function createSandGranules({
 
         for (let i = 0; i < c; i++) {
             const spreadAngle = rng.between(0, Math.PI * 2);
-            const spreadDist = rng.between(0.05, 0.42);
+            const spreadDist = rng.between(0.02, 0.22);
             const px = footPos.x + Math.cos(spreadAngle) * spreadDist;
             const pz = footPos.z + Math.sin(spreadAngle) * spreadDist;
-            const py = footPos.y + rng.between(0.04, 0.15);
+            const py = footPos.y + rng.between(0.02, 0.08);
 
             // Струя песка летит назад от вектора движения стопы с веерным разбросом
-            const ejectSpeed = rng.between(1.2, 3.8) * intensity;
-            const dirX = -fvx * 0.7 + (rng.next() - 0.5) * 2.2;
-            const dirZ = -fvz * 0.7 + (rng.next() - 0.5) * 2.2;
+            const ejectSpeed = rng.between(1.1, 3.2) * intensity;
+            const dirX = -fvx * 0.7 + (rng.next() - 0.5) * 2.0;
+            const dirZ = -fvz * 0.7 + (rng.next() - 0.5) * 2.0;
             const dirLen = Math.hypot(dirX, dirZ) || 1.0;
 
             const vx = (dirX / dirLen) * ejectSpeed;
-            const vy = rng.between(1.2, 3.5) * intensity;
+            const vy = rng.between(0.95, 2.7) * intensity;
             const vz = (dirZ / dirLen) * ejectSpeed;
-            const sz = rng.between(0.7, 1.3) * intensity;
-            const dur = rng.between(0.6, 1.4);
+            const sz = rng.between(0.42, 0.82) * Math.min(1.15, Math.max(0.45, intensity));
+            const dur = rng.between(0.5, 1.15);
 
             emitGranule(px, py, pz, vx, vy, vz, sz, dur, vGrain);
         }
@@ -214,16 +220,16 @@ export function createSandGranules({
 
         for (let i = 0; i < c; i++) {
             const angle = rng.between(0, Math.PI * 2);
-            const speed = rng.between(3.5, 9.0) * intensity;
-            const px = centerPos.x + (rng.next() - 0.5) * 1.2;
-            const pz = centerPos.z + (rng.next() - 0.5) * 1.2;
-            const py = centerPos.y + rng.between(0.05, 0.25);
+            const speed = rng.between(3.2, 8.2) * intensity;
+            const px = centerPos.x + (rng.next() - 0.5) * 0.95;
+            const pz = centerPos.z + (rng.next() - 0.5) * 0.95;
+            const py = centerPos.y + rng.between(0.04, 0.18);
 
             const vx = Math.cos(angle) * speed;
-            const vy = rng.between(1.5, 5.0) * intensity;
+            const vy = rng.between(1.3, 4.2) * intensity;
             const vz = Math.sin(angle) * speed;
-            const sz = rng.between(0.8, 1.5);
-            const dur = rng.between(0.8, 1.8);
+            const sz = rng.between(0.48, 0.92);
+            const dur = rng.between(0.7, 1.5);
 
             emitGranule(px, py, pz, vx, vy, vz, sz, dur, vGrain);
         }
@@ -383,8 +389,10 @@ export function createSandGranules({
                 }
             }
 
+            const ageRatio = life[i] / Math.max(0.001, maxLife[i]);
+            const taper = Math.max(0.18, 1.0 - 0.65 * ageRatio * ageRatio);
             dummy.position.set(posX[i], posY[i], posZ[i]);
-            dummy.scale.setScalar(scale[i]);
+            dummy.scale.setScalar(scale[i] * taper);
             dummy.updateMatrix();
             instanced.setMatrixAt(i, dummy.matrix);
             rendered++;

@@ -140,3 +140,38 @@ test('a full pool consumes emission attempts and reuses the first expired slot',
     assert.equal(instance(mesh, 1).position.y, -100);
     assert.equal(random.mock.callCount(), 5);
 });
+
+test('dust and sandstorm wind layers use fine grain geometry and update across weather states', async t => {
+    const { createSandStorm } = await import('../src/world/sandStorm.ts');
+    const scene = new THREE.Scene();
+    const { mesh } = createDustHarness(t);
+
+    // Verify dust particle base geometry is fine (< 0.1m) rather than bulky cubes
+    mesh.geometry.computeBoundingBox();
+    const dustSize = new THREE.Vector3();
+    mesh.geometry.boundingBox.getSize(dustSize);
+    assert.ok(dustSize.x <= 0.1 && dustSize.y <= 0.1 && dustSize.z <= 0.1, `dust base geometry should be fine-grained, got ${dustSize.x}`);
+
+    // Verify 3-layer wind system (streamlines, saltation ribbons, and airborne sand specks)
+    const windAt = (out) => out.set(6, 0, -4);
+    const storm = createSandStorm({ scene, getHeightAt: getDuneHeight, windAt });
+    t.after(() => storm.dispose());
+
+    const instancedMeshes = scene.children.filter(c => c.isInstancedMesh && c !== mesh);
+    assert.equal(instancedMeshes.length, 3, 'sandStorm should create 3 instanced layers (streamlines, saltation ribbons, airborne grains)');
+
+    const focus = new THREE.Vector3(0, 0, 0);
+    storm.update(0.05, focus, {
+        windVector: new THREE.Vector3(5, 0, -3),
+        windDir: new THREE.Vector2(0.85, -0.52),
+        windSpeed: 6,
+        gust: 0.4,
+        intensity: 0.35,
+    });
+
+    for (const layer of instancedMeshes) {
+        assert.equal(layer.visible, true, 'all wind layers should be visible in breeze/dust conditions');
+        assert.ok(layer.material.opacity > 0.05, 'wind layer opacity should be perceptible');
+    }
+});
+

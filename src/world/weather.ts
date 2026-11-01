@@ -19,6 +19,7 @@ const FOG_STORM_FALLBACK = new THREE.Color(PALETTE.stormFog).convertLinearToSRGB
 export interface WeatherState {
     mode: string;
     intensity: number;
+    stormIntensity?: number;
     target: number;
     gust: number;
     time: number;

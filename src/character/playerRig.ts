@@ -78,8 +78,8 @@ export function createPlayerRig({
     const characterController = world.createCharacterController(0.04);
     characterController.setUp({ x: 0.0, y: 1.0, z: 0.0 });
     characterController.setSlideEnabled(true);
-    // Устанавливаем запас по углу граней heightfield для KCC (58°/55°), чтобы микро-валики отпечатков
-    // на склонах 30°–40° не вызывали заклинивание коллайдера (макро-уклон контролируется в playerController).
+    // Устанавливаем запас по углу граней для KCC (58°/55°), чтобы микро-валики отпечатков
+    // и наклонные марши лестниц (~53.6°) проходились без заклинивания коллайдера.
     characterController.setMaxSlopeClimbAngle(Math.max(config.maxSlopeClimbAngle ?? 0, 58 * Math.PI / 180));
     characterController.setMinSlopeSlideAngle(Math.max(config.minSlopeSlideAngle ?? 0, 55 * Math.PI / 180));
     if ((config.enableAutostep as boolean | undefined) !== false) {
@@ -159,19 +159,20 @@ export function createPlayerRig({
     }
 
     /**
-     * Выполняет вертикальный луч в физическом мире Rapier (игнорируя собственную капсулу персонажа)
+     * Выполняет вертикальный луч в физическом мире Rapier (игнорируя собственную капсулу персонажа и стены)
      * для согласования высоты и нормали рельефа, когда внешний groundSampler не передан.
      */
     function sampleWorldGround(x: number, z: number): { y: number; normal: THREE.Vector3; surfaceType: 'sand' | 'solid'; materialId: string } | null {
         if (disposed || !world || typeof world.castRayAndGetNormal !== 'function') return null;
         const currentFeetY = getFeetPosition().y;
         probeRay.origin.x = x;
-        probeRay.origin.y = currentFeetY + 25.0;
+        probeRay.origin.y = currentFeetY + 1.45;
         probeRay.origin.z = z;
+        const wallHandles: Set<number> | undefined = (world as any).__wallColliderHandles;
 
         const hit = world.castRayAndGetNormal(
             probeRay,
-            60.0,
+            30.0,
             true,
             undefined,
             undefined,
@@ -179,6 +180,8 @@ export function createPlayerRig({
             body,
             (col: any) => {
                 if (!col || col.handle === collider.handle) return false;
+                if (wallHandles && wallHandles.has(col.handle)) return false;
+                if (typeof col.isSensor === 'function' && col.isSensor()) return false;
                 const parent = col.parent?.();
                 if (parent && parent.handle === body.handle) return false;
                 if (col.shape?.type === RAPIER.ShapeType.Capsule) return false;

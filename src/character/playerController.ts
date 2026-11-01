@@ -11,7 +11,7 @@ import {
     type GroundSample
 } from '../world/groundSampler.ts';
 
-export type GroundQuery = ((x: number, z: number) => any) | null;
+export type GroundQuery = ((x: number, z: number, referenceY?: number) => any) | null;
 
 export type MovementLimitReason =
     | 'none'
@@ -104,6 +104,7 @@ export interface PlayerVisualState {
 
 export interface PlayerController {
     rig: PlayerRig | null;
+    onAction(name: string, phase: string, repeat?: boolean): void;
     update(dt: number, ctx?: any): any;
     simulateStep(dt: number, command: any, weatherState?: any): { motion: PlayerControllerMotion; support: any };
     consumeContactEvents(): CosmoContactEvent[];
@@ -111,6 +112,7 @@ export interface PlayerController {
     getProbes(): CharacterGroundProbes;
     setModelDebug?(modelDebug: any): void;
     setWaypoint(): void;
+    setPose(x: number, y: number, z: number, newYaw?: number): void;
     reset(): void;
     getPose(): { position: THREE.Vector3; currentYaw: number; flatFwd: THREE.Vector3 };
     getVisualPose(alpha?: number): { position: THREE.Vector3; currentYaw: number; flatFwd: THREE.Vector3 };
@@ -144,8 +146,8 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
 
     const playerRig = rig || (world ? createPlayerRig({ world, spawnPosition: spawnVec, config }) : null);
 
-    const effectiveGroundAt: (x: number, z: number) => any = hasCustomGroundAt
-        ? (options.groundAt as (x: number, z: number) => any)
+    const effectiveGroundAt: (x: number, z: number, referenceY?: number) => any = hasCustomGroundAt
+        ? (options.groundAt as (x: number, z: number, referenceY?: number) => any)
         : (playerRig && typeof playerRig.sampleWorldGround === 'function'
             ? (x: number, z: number) => playerRig.sampleWorldGround!(x, z) ?? 0
             : () => 0);
@@ -155,8 +157,14 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
     const filteredNormal = new THREE.Vector3(0, 1, 0);
     const tangentVec = new THREE.Vector3();
 
-    function sampleGround(x: number, z: number, out: GroundSample = scratchSample, computeNormal = true): GroundSample {
-        return resolveGroundSample(effectiveGroundAt, x, z, out, computeNormal);
+    function sampleGround(
+        x: number,
+        z: number,
+        out: GroundSample = scratchSample,
+        computeNormal = true,
+        referenceY?: number
+    ): GroundSample {
+        return resolveGroundSample(effectiveGroundAt, x, z, out, computeNormal, referenceY);
     }
 
     const initialSample = sampleGround(spawnVec.x, spawnVec.z, scratchSample, false);
@@ -185,6 +193,8 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
     let visualYaw = 0;
 
     let crouch = 0;
+    let prevCrouchInput = false;
+    let pendingCrouchToggle = false;
     let verticalVelocity = 0;
     let grounded = !playerRig ? (spawnVec.y <= 0.02) : (Math.abs(initialY - initialSample.y) <= 0.15 || spawnVec.y <= 0.02);
     let walkPhase = 0;
@@ -213,6 +223,9 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
     let isOnCrest = false;
     let currentForwardSpeed = 0;
     let currentForwardAccel = 0;
+    let velX = 0;
+    let velZ = 0;
+    let yawAngularVel = 0;
 
     const slideMinAngle = config.slideMinAngle ?? (22 * Math.PI / 180);
     const slideExitAngle = config.slideExitAngle ?? (14 * Math.PI / 180);
@@ -275,24 +288,45 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         });
     }
 
-    function updateProbes(x: number, z: number, dirX: number, dirZ: number) {
+    function updateProbes(x: number, z: number, dirX: number, dirZ: number, referenceY?: number) {
         const len = Math.hypot(dirX, dirZ);
         const fwdX = len > 1e-4 ? dirX / len : Math.sin(yaw);
         const fwdZ = len > 1e-4 ? dirZ / len : Math.cos(yaw);
         const rightX = Math.cos(yaw);
         const rightZ = -Math.sin(yaw);
-        sampleCharacterGroundProbes(effectiveGroundAt, x, z, fwdX, fwdZ, rightX, rightZ, config, probes);
+        sampleCharacterGroundProbes(effectiveGroundAt, x, z, fwdX, fwdZ, rightX, rightZ, config, probes, referenceY);
     }
 
     // Инициализируем пробы в точке спавна
-    updateProbes(currPosition.x, currPosition.z, Math.sin(yaw), Math.cos(yaw));
+    updateProbes(currPosition.x, currPosition.z, Math.sin(yaw), Math.cos(yaw), currPosition.y);
     filteredNormal.copy(probes.center.normal);
+
+    function onAction(name: string, phase: string, repeat = false): void {
+        if (name === 'crouch' && phase === 'down' && !repeat) {
+            pendingCrouchToggle = true;
+        }
+    }
 
     function update(dt: number, ctx: any = {}): any {
         const actions = ctx.actions || {};
         const moveX = (actions.right ? 1 : 0) - (actions.left ? 1 : 0);
         const moveZ = (actions.forward ? 1 : 0) - (actions.backward ? 1 : 0);
-        crouch = actions.crouchDown ? 1 : (actions.crouchUp ? 0 : crouch);
+        const crouchPressed = Boolean(actions.crouch);
+        if (pendingCrouchToggle) {
+            crouch = crouch ? 0 : 1;
+            pendingCrouchToggle = false;
+            prevCrouchInput = crouchPressed;
+        } else if (crouchPressed && !prevCrouchInput) {
+            crouch = crouch ? 0 : 1;
+            prevCrouchInput = true;
+        } else {
+            prevCrouchInput = crouchPressed;
+        }
+        if (actions.crouchDown) {
+            crouch = 1;
+        } else if (actions.crouchUp) {
+            crouch = 0;
+        }
 
         let localX = moveX;
         let localZ = moveZ;
@@ -319,15 +353,29 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             while (error > Math.PI) error -= Math.PI * 2;
             while (error < -Math.PI) error += Math.PI * 2;
 
-            // Критически демпфированный поворот без резких скачков
-            const turnRate = 12.0;
-            const maxTurnStep = dt * 14.0;
-            const turnDelta = THREE.MathUtils.clamp(error * Math.min(1.0, dt * turnRate), -maxTurnStep, maxTurnStep);
+            // Инерционный поворот с учетом текущей скорости и веса персонажа (85 кг)
+            const sprintRef = runSpeed ?? config.runSpeed ?? (speed * 1.9);
+            const speedRatio = THREE.MathUtils.clamp(currentForwardSpeed / Math.max(0.1, sprintRef), 0, 1);
+            const turnRate = THREE.MathUtils.lerp(
+                config.turnRateIdle ?? 11.0,
+                config.turnRateSprint ?? 6.4,
+                speedRatio
+            );
+            const maxTurnVel = THREE.MathUtils.lerp(13.5, 7.8, speedRatio);
+            const desiredAngVel = THREE.MathUtils.clamp(error * turnRate, -maxTurnVel, maxTurnVel);
+            const angBlend = dt >= 0.04 ? 1.0 : Math.min(1.0, dt * 16.0);
+            yawAngularVel += (desiredAngVel - yawAngularVel) * angBlend;
+            const turnDelta = THREE.MathUtils.clamp(yawAngularVel * dt, -Math.abs(error), Math.abs(error));
             yaw += turnDelta;
 
-            // Динамический наклон (banking) при повороте на бегу
+            // Динамический наклон (banking) при повороте на бегу с учетом скорости
             const turnAngVel = turnDelta / Math.max(1e-4, dt);
-            bankingRoll = THREE.MathUtils.clamp(-turnAngVel * 0.045 * Math.min(1, inputLength), -0.16, 0.16);
+            const speedBankBoost = 0.70 + 0.50 * speedRatio;
+            bankingRoll = THREE.MathUtils.clamp(
+                -turnAngVel * 0.048 * speedBankBoost * Math.min(1, inputLength),
+                -0.18,
+                0.18
+            );
 
             worldX = dirX;
             worldZ = dirZ;
@@ -338,24 +386,43 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             lastMoveX = (cosY * dirX - sinY * dirZ) * Math.min(1, inputLength);
             lastMoveZ = (sinY * dirX + cosY * dirZ) * Math.min(1, inputLength);
         } else {
-            if (inputLength > 1) {
-                localX /= inputLength;
-                localZ /= inputLength;
+            yawAngularVel *= Math.max(0, 1.0 - dt * 14.0);
+            if (inputLength > 0) {
+                if (inputLength > 1) {
+                    localX /= inputLength;
+                    localZ /= inputLength;
+                }
+                lastMoveX = localX;
+                lastMoveZ = localZ;
+                bankingRoll = 0;
+                // Резервный режим без привязки к камере
+                worldX = Math.sin(yaw) * localZ + Math.cos(yaw) * localX;
+                worldZ = Math.cos(yaw) * localZ - Math.sin(yaw) * localX;
+            } else {
+                // При отпускании клавиш сохраняем локальный вектор инерционного торможения для шагов доводки
+                const vLen = Math.hypot(velX, velZ);
+                if (vLen > 0.06) {
+                    const cosY = Math.cos(yaw);
+                    const sinY = Math.sin(yaw);
+                    lastMoveX = (cosY * velX - sinY * velZ) / vLen;
+                    lastMoveZ = (sinY * velX + cosY * velZ) / vLen;
+                } else {
+                    lastMoveX = 0;
+                    lastMoveZ = 0;
+                }
+                bankingRoll = 0;
+                worldX = 0;
+                worldZ = 0;
             }
-            lastMoveX = localX;
-            lastMoveZ = localZ;
-            bankingRoll = 0;
-            // Резервный режим без привязки к камере
-            worldX = Math.sin(yaw) * localZ + Math.cos(yaw) * localX;
-            worldZ = Math.cos(yaw) * localZ - Math.sin(yaw) * localX;
         }
 
         smoothBanking += (bankingRoll - smoothBanking) * Math.min(1.0, dt * 9.0);
 
         // --- Многоточечный опрос поверхности (центр, левая/правая стопа, впереди, позади) ---
-        const probeDirX = inputLength > 0.01 ? worldX : Math.sin(yaw);
-        const probeDirZ = inputLength > 0.01 ? worldZ : Math.cos(yaw);
-        updateProbes(currPosition.x, currPosition.z, probeDirX, probeDirZ);
+        const velNorm = Math.hypot(velX, velZ);
+        const probeDirX = inputLength > 0.01 ? worldX : (velNorm > 0.08 ? velX / velNorm : Math.sin(yaw));
+        const probeDirZ = inputLength > 0.01 ? worldZ : (velNorm > 0.08 ? velZ / velNorm : Math.cos(yaw));
+        updateProbes(currPosition.x, currPosition.z, probeDirX, probeDirZ, currPosition.y);
 
         const groundInfo = probes.center;
         // Сглаживание эффективной нормали по центру и стопам для защиты от локального шума отпечатков и гребней
@@ -402,16 +469,20 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             // Продольный наклон по нормали поверхности + по передней пробе
             // Если впереди небольшой уступ в пределах autostepMaxHeight с плоской верхней гранью,
             // не считаем вертикальную грань уступа крутым склоном, чтобы сохранить работу autostep.
+            // Аналогично при сходе с твердой плиты (фундамента/потолка) не считаем обрыв крутым склоном.
             const maxAutostep = config.autostepMaxHeight ?? COSMO.autostepMaxHeight ?? 0.32;
             const aheadHoriz = Math.hypot(probes.ahead.normal.x, probes.ahead.normal.z);
             const aheadNormalSlope = Math.atan2(aheadHoriz, Math.max(0.05, probes.ahead.normal.y));
             const isSteppableLedge = deltaAhead > 0.01 && deltaAhead <= maxAutostep && aheadNormalSlope < terrainSlopeAngle + 0.20;
+            const isSolidDropOff = groundInfo.surfaceType === 'solid' && deltaAhead < -0.08;
 
             const normalLongSlope = Math.atan2(-(nx * dirX + nz * dirZ), ny);
             const rawProbeSlope = Math.atan2(deltaAhead, aheadDist);
-            const probeLongSlope = isSteppableLedge
-                ? Math.min(rawProbeSlope, Math.max(normalLongSlope, aheadNormalSlope) + 0.08)
-                : rawProbeSlope;
+            const probeLongSlope = isSolidDropOff
+                ? normalLongSlope
+                : (isSteppableLedge
+                    ? Math.min(rawProbeSlope, Math.max(normalLongSlope, aheadNormalSlope) + 0.08)
+                    : rawProbeSlope);
             moveSlopeAngle = isOnCrest
                 ? normalLongSlope * 0.5 + probeLongSlope * 0.25
                 : normalLongSlope * 0.45 + probeLongSlope * 0.55;
@@ -419,11 +490,25 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             // Поперечный уклон по нормали поверхности и перепаду между стопами
             const normalCrossSlope = Math.atan2(Math.abs(nx * rightMoveX + nz * rightMoveZ), ny);
             const footSpan = (config.probeFootOffsetX ?? 0.19) * 2.0;
-            const probeCrossSlope = Math.atan2(Math.abs(probes.leftFoot.y - probes.rightFoot.y), footSpan);
+            const footHeightDiff = Math.abs(probes.leftFoot.y - probes.rightFoot.y);
+            const isSolidEdgeStraddle = (
+                groundInfo.surfaceType === 'solid' ||
+                probes.leftFoot.surfaceType === 'solid' ||
+                probes.rightFoot.surfaceType === 'solid'
+            ) && footHeightDiff > 0.18;
+            const probeCrossSlope = isSolidEdgeStraddle
+                ? normalCrossSlope
+                : Math.atan2(footHeightDiff, footSpan);
             crossSlopeAngle = normalCrossSlope * 0.65 + probeCrossSlope * 0.35;
         } else {
             const footSpan = (config.probeFootOffsetX ?? 0.19) * 2.0;
-            crossSlopeAngle = Math.atan2(Math.abs(probes.leftFoot.y - probes.rightFoot.y), footSpan);
+            const footHeightDiff = Math.abs(probes.leftFoot.y - probes.rightFoot.y);
+            const isSolidEdgeStraddle = (
+                groundInfo.surfaceType === 'solid' ||
+                probes.leftFoot.surfaceType === 'solid' ||
+                probes.rightFoot.surfaceType === 'solid'
+            ) && footHeightDiff > 0.18;
+            crossSlopeAngle = isSolidEdgeStraddle ? 0 : Math.atan2(footHeightDiff, footSpan);
         }
 
         currentUphillAngle = Math.max(0, moveSlopeAngle);
@@ -445,7 +530,11 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         }
 
         // --- Гистерезис ограничения движения на слишком крутом склоне ---
-        const maxAllowedAngle = groundInfo.maxContactAngle ?? (config.maxSlopeClimbAngle ?? (45 * Math.PI / 180));
+        const baseMaxAngle = groundInfo.maxContactAngle ?? (config.maxSlopeClimbAngle ?? (45 * Math.PI / 180));
+        const isClimbingSolid = groundInfo.surfaceType === 'solid' || probes.ahead.surfaceType === 'solid';
+        const maxAllowedAngle = isClimbingSolid
+            ? Math.max(baseMaxAngle, 60 * Math.PI / 180)
+            : baseMaxAngle;
         const maxAutostepH = config.autostepMaxHeight ?? COSMO.autostepMaxHeight ?? 0.32;
         const dotDown = worldX * downhillX + worldZ * downhillZ;
         const climbingSteep = moveNorm > 0.01 && (dotDown < -0.15 || deltaAhead > maxAutostepH);
@@ -547,10 +636,13 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             const crossSlowdown = config.crossSlopeMaxSlowdown ?? 0.18;
 
             if (moveSlopeAngle > 0.01) {
-                // Подъем в гору: плавное замедление до (1 - uphillSlowdown)
+                // Подъем в гору: плавное замедление до (1 - uphillSlowdown); на твердых лестницах замедление минимально
                 const sinSlope = Math.sin(moveSlopeAngle);
                 const climbRatio = THREE.MathUtils.clamp(sinSlope / Math.sin(45 * Math.PI / 180), 0, 1);
-                targetSlopeFactor *= (1.0 - uphillSlowdown * climbRatio);
+                const effectiveUphillSlowdown = (isClimbingSolid && moveSlopeAngle > 0.35)
+                    ? uphillSlowdown * 0.35
+                    : uphillSlowdown;
+                targetSlopeFactor *= (1.0 - effectiveUphillSlowdown * climbRatio);
             } else if (moveSlopeAngle < -0.01) {
                 // Спуск под гору: контролируемое ускорение до (1 + downhillSpeedup)
                 const sinDescent = -Math.sin(moveSlopeAngle);
@@ -599,26 +691,32 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             currentSlopeFactor += (targetSlopeFactor - currentSlopeFactor) * slopeBlend;
             effectiveSpeed *= currentSlopeFactor;
 
-            let targetWalk = Math.min(1, inputLength);
+            // Сохраняем амплитуду и фазу шага во время инерционного торможения (1-2 тяжелых шага до остановки)
+            const inertiaWalk = (!isSliding && currentForwardSpeed > 0.08)
+                ? THREE.MathUtils.clamp(currentForwardSpeed / Math.max(0.1, speed * 1.05), 0, 0.92)
+                : 0;
+            let targetWalk = Math.max(Math.min(1, inputLength), inertiaWalk);
             if (lastObstacleResistance) {
                 targetWalk *= 0.15; // замедление шага при упоре в препятствие
                 movementLimitReason = 'obstacle_blocked';
             } else if (isSteepSlopeBlocked) {
                 targetWalk *= 0.35;
             }
-            const rampRate = targetWalk > walkAmount ? 8.0 : 10.0;
+            const rampRate = targetWalk > walkAmount
+                ? 8.0
+                : (inputLength > 0.01 ? 9.0 : (currentForwardSpeed > 0.05 ? 6.5 : 16.0));
             walkAmount += THREE.MathUtils.clamp((targetWalk - walkAmount) * dt * rampRate, -1, 1);
-            if (targetWalk === 0 && walkAmount < 0.01) walkAmount = 0;
+            if (targetWalk === 0 && currentForwardSpeed < 0.05) {
+                walkAmount = Math.max(0, walkAmount - dt * 3.2);
+            }
+            if (targetWalk === 0 && walkAmount < 0.02) walkAmount = 0;
 
+            const phaseSpeed = inputLength > 0.01
+                ? effectiveSpeed
+                : Math.max(speed * 0.55, currentForwardSpeed);
             const cadenceMultiplier = isSprinting ? 2.1 : 2.6;
-            walkPhase += walkAmount * effectiveSpeed * dt * cadenceMultiplier;
+            walkPhase += walkAmount * phaseSpeed * dt * cadenceMultiplier;
         }
-
-        // Отслеживание продольного ускорения для наклона корпуса при разгоне/торможении
-        const targetFwdSpeed = (inputLength > 0.01 || isSliding) ? effectiveSpeed * Math.min(1, Math.max(inputLength, isSliding ? 1 : 0)) : 0;
-        const rawAccel = (targetFwdSpeed - currentForwardSpeed) / Math.max(1e-3, dt);
-        currentForwardAccel += (THREE.MathUtils.clamp(rawAccel, -18.0, 18.0) - currentForwardAccel) * Math.min(1.0, dt * 10.0);
-        currentForwardSpeed = targetFwdSpeed;
 
         // Прыжок Cosmo (поддерживается и во время скольжения, выталкивая вверх)
         if (grounded && (actions.jump || (actions.crouchUp && !crouch && actions.isJumpIntent))) {
@@ -663,11 +761,103 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         const cmdWorldX = command.worldX || 0;
         const cmdWorldZ = command.worldZ || 0;
         const cmdSpeed = command.speed || 0;
+        const cmdDirLen = Math.hypot(cmdWorldX, cmdWorldZ);
+        const hasMoveCommand = Boolean(command.isManual) || isSliding || cmdDirLen > 0.01;
+
+        // --- Интегрирование горизонтальной скорости с учетом массы (85 кг), инерции разгона и тормозного выбега ---
+        const prevVelX = velX;
+        const prevVelZ = velZ;
+        const prevSpeed = Math.hypot(prevVelX, prevVelZ);
+        const targetVx = hasMoveCommand ? cmdWorldX * cmdSpeed : 0;
+        const targetVz = hasMoveCommand ? cmdWorldZ * cmdSpeed : 0;
+        const targetSpeed = Math.hypot(targetVx, targetVz);
+
+        const surfFriction = probes.center.surfaceType === 'solid'
+            ? 1.08
+            : (0.88 + (probes.center.packing || 0) * 0.12 - Math.min(0.10, (probes.center.sink || 0) * 0.25));
+
+        if (isSliding) {
+            velX = targetVx;
+            velZ = targetVz;
+        } else if (!grounded) {
+            // В воздухе сохраняется горизонтальный импульс прыжка с плавным воздушным подруливанием
+            const airControl = config.airControlFactor ?? 0.35;
+            const airAccel = hasMoveCommand
+                ? (config.walkAccel ?? 11.5) * airControl
+                : 1.8;
+            const dvX = targetVx - velX;
+            const dvZ = targetVz - velZ;
+            const dvLen = Math.hypot(dvX, dvZ);
+            const maxDv = airAccel * dt;
+            if (dvLen <= maxDv || dt >= 0.25) {
+                velX = targetVx;
+                velZ = targetVz;
+            } else if (dvLen > 1e-5) {
+                velX += (dvX / dvLen) * maxDv;
+                velZ += (dvZ / dvLen) * maxDv;
+            }
+        } else if (hasMoveCommand && targetSpeed > 0.01) {
+            // Разгон, смена направления (разворот с гашением инерции) или переход со спринта на шаг
+            let accelRate: number;
+            const dot = prevSpeed > 0.35
+                ? (velX * targetVx + velZ * targetVz) / (prevSpeed * targetSpeed)
+                : 1.0;
+            if (dot < -0.15) {
+                accelRate = (config.pivotDecel ?? 14.5) * surfFriction;
+            } else if (targetSpeed >= prevSpeed - 0.05) {
+                const useSprintAccel = Boolean(command.isSprinting ?? isSprinting);
+                accelRate = (useSprintAccel ? (config.sprintAccel ?? 14.5) : (config.walkAccel ?? 11.5)) * surfFriction;
+            } else {
+                accelRate = (config.walkStopDecel ?? 7.2) * surfFriction;
+            }
+
+            const dvX = targetVx - velX;
+            const dvZ = targetVz - velZ;
+            const dvLen = Math.hypot(dvX, dvZ);
+            const maxDv = accelRate * dt;
+            if (dvLen <= maxDv || dt >= 0.25) {
+                velX = targetVx;
+                velZ = targetVz;
+            } else if (dvLen > 1e-5) {
+                velX += (dvX / dvLen) * maxDv;
+                velZ += (dvZ / dvLen) * maxDv;
+            }
+        } else {
+            // Инерционное торможение при остановке (вес 85 кг не позволяет замереть за 1 кадр)
+            const stopDecelBase = prevSpeed > speed * 1.15
+                ? (config.sprintStopDecel ?? 8.6)
+                : (config.walkStopDecel ?? 7.2);
+            const decelStep = stopDecelBase * surfFriction * dt;
+            const stopThresh = config.stopSpeedThreshold ?? 0.04;
+            if (prevSpeed <= Math.max(decelStep, stopThresh)) {
+                velX = 0;
+                velZ = 0;
+            } else {
+                const nextSpd = prevSpeed - decelStep;
+                const scale = nextSpd / prevSpeed;
+                velX *= scale;
+                velZ *= scale;
+            }
+        }
+
+        const stepHorizX = velX * dt;
+        const stepHorizZ = velZ * dt;
+        const effectiveStepSpeed = Math.hypot(velX, velZ);
 
         if (playerRig) {
             // === РЕЖИМ 1: Rapier 3D Kinematic Character Controller ===
-            const horizX = cmdWorldX * cmdSpeed * dt;
-            const horizZ = cmdWorldZ * cmdSpeed * dt;
+            const onSolidStairClimb =
+                grounded &&
+                verticalVelocity <= 0 &&
+                currentUphillAngle > 0.35 &&
+                (probes.center.surfaceType === 'solid' || probes.ahead.surfaceType === 'solid');
+            // Компенсация проекции вектора скольжения KCC на крутых твердых маршах лестниц (1 / cos(theta)),
+            // чтобы персонаж поднимался по лестнице без потери горизонтального темпа
+            const solidClimbBoost = onSolidStairClimb
+                ? (1.0 / Math.max(0.50, Math.cos(currentUphillAngle)))
+                : 1.0;
+            const horizX = stepHorizX * solidClimbBoost;
+            const horizZ = stepHorizZ * solidClimbBoost;
 
             // Проекция движения по касательной к поверхности для плавного сопровождения спуска
             let tangentY = 0;
@@ -678,7 +868,7 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
                 if (isOnCrest && tangentY > 0) {
                     tangentY *= (1.0 - (config.crestSmoothFactor ?? 0.65));
                 }
-                tangentY = THREE.MathUtils.clamp(tangentY, -Math.abs(cmdSpeed * dt * 1.2), Math.abs(cmdSpeed * dt * 1.2));
+                tangentY = THREE.MathUtils.clamp(tangentY, -Math.abs(effectiveStepSpeed * dt * 1.2), Math.abs(effectiveStepSpeed * dt * 1.2));
             }
 
             // Гравитация и вертикальное смещение:
@@ -707,22 +897,38 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
 
             // Согласование положения Cosmo с реальной высотой поверхности после физического подшага
             // (мягкая защита от проваливания капсулы под рельеф и плавная доводка на гребнях без скачков).
+            // При сходе с твердой плиты или заходе на твердую лестницу не вдавливаем капсулу вниз в коллайдер.
+            const nearSolidLedge =
+                probes.center.surfaceType === 'solid' ||
+                probes.ahead.surfaceType === 'solid' ||
+                probes.behind.surfaceType === 'solid' ||
+                probes.leftFoot.surfaceType === 'solid' ||
+                probes.rightFoot.surfaceType === 'solid';
+            let postSurfaceY = currPosition.y;
             if (hasCustomGroundAt || typeof playerRig.sampleWorldGround === 'function') {
-                const postSample = sampleGround(currPosition.x, currPosition.z, scratchSample, true);
+                const postSample = sampleGround(currPosition.x, currPosition.z, scratchSample, true, currPosition.y);
                 const worldGround = (hasCustomGroundAt && typeof playerRig.sampleWorldGround === 'function')
                     ? playerRig.sampleWorldGround(currPosition.x, currPosition.z)
                     : null;
                 const surfaceY = worldGround ? Math.max(postSample.y, worldGround.y) : postSample.y;
+                postSurfaceY = surfaceY;
                 const heightDiff = surfaceY - currPosition.y;
 
-                if (heightDiff > 0.015 && verticalVelocity <= 0.5) {
+                if (heightDiff > 0.015 && heightDiff <= 0.50 && verticalVelocity <= 0.5) {
                     const liftBlend = heightDiff > 0.08 ? 1.0 : 0.45;
                     currPosition.y += heightDiff * liftBlend;
                     playerRig.setFeetPosition(currPosition.x, currPosition.y, currPosition.z);
                     grounded = true;
                 } else if (verticalVelocity <= 0 && Math.abs(heightDiff) <= 0.025) {
                     grounded = true;
-                } else if (grounded && verticalVelocity <= 0 && heightDiff < -0.015 && heightDiff > -(config.snapToGroundDistance ?? 0.35)) {
+                } else if (
+                    grounded &&
+                    !nearSolidLedge &&
+                    postSample.surfaceType === 'sand' &&
+                    verticalVelocity <= 0 &&
+                    heightDiff < -0.015 &&
+                    heightDiff > -(config.snapToGroundDistance ?? 0.35)
+                ) {
                     const snapRate = isOnCrest ? 0.35 : 0.45;
                     currPosition.y += heightDiff * snapRate;
                     playerRig.setFeetPosition(currPosition.x, currPosition.y, currPosition.z);
@@ -730,12 +936,12 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
             }
 
             // Плавная фильтрация вертикального шага над свежими воронками/валиками собственных отпечатков
-            if (grounded && verticalVelocity <= 0 && requestedDist > 1e-4) {
+            if (grounded && wasGrounded && !nearSolidLedge && verticalVelocity <= 0 && requestedDist > 1e-4) {
                 const rawY = currPosition.y;
                 const rawDy = rawY - prevPosition.y;
                 const maxD2y = 0.014;
                 smoothStepDy += THREE.MathUtils.clamp(rawDy - smoothStepDy, -maxD2y, maxD2y);
-                const smoothedY = prevPosition.y + smoothStepDy;
+                const smoothedY = Math.max(prevPosition.y + smoothStepDy, postSurfaceY);
                 if (Math.abs(smoothedY - rawY) <= 0.035) {
                     currPosition.y = smoothedY;
                     smoothStepDy = currPosition.y - prevPosition.y;
@@ -744,7 +950,7 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
                     smoothStepDy = rawDy;
                 }
             } else {
-                smoothStepDy = currPosition.y - prevPosition.y;
+                smoothStepDy = 0;
             }
 
             if (grounded && verticalVelocity < 0) {
@@ -756,16 +962,20 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
                 const actualDist = Math.hypot(movement.x, movement.z);
                 const climbedUp = movement.y > requestedDist * 0.12;
                 lastObstacleResistance = (actualDist / requestedDist) < 0.2 && !climbedUp && !isSteepSlopeBlocked;
-                if (lastObstacleResistance && movementLimitReason === 'none') {
-                    movementLimitReason = 'obstacle_blocked';
+                if (lastObstacleResistance) {
+                    velX *= 0.25;
+                    velZ *= 0.25;
+                    if (movementLimitReason === 'none') {
+                        movementLimitReason = 'obstacle_blocked';
+                    }
                 }
             } else {
                 lastObstacleResistance = false;
             }
         } else {
             // === РЕЖИМ 2: Аналитический Fallback для легковесных тестов ===
-            currPosition.x += cmdWorldX * cmdSpeed * dt;
-            currPosition.z += cmdWorldZ * cmdSpeed * dt;
+            currPosition.x += stepHorizX;
+            currPosition.z += stepHorizZ;
 
             const postSample = sampleGround(currPosition.x, currPosition.z, scratchSample, false);
             const groundY = postSample.y;
@@ -800,10 +1010,22 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         currYaw = yaw;
         flatFwd.set(Math.sin(yaw), 0, Math.cos(yaw));
 
+        // Вычисляем реальную скорость и продольное ускорение корпуса для переноса веса (разгон/торможение)
+        const newSpeed = Math.hypot(velX, velZ);
+        const prevSignedFwd = prevVelX * flatFwd.x + prevVelZ * flatFwd.z;
+        const newSignedFwd = velX * flatFwd.x + velZ * flatFwd.z;
+        const rawStepAccel = (newSignedFwd - prevSignedFwd) / Math.max(1e-3, dt);
+        if (newSpeed < 1e-3 && prevSpeed < 1e-3) {
+            currentForwardAccel = 0;
+        } else {
+            currentForwardAccel += (THREE.MathUtils.clamp(rawStepAccel, -18.0, 18.0) - currentForwardAccel) * Math.min(1.0, dt * 14.0);
+        }
+        currentForwardSpeed = isSliding ? slideSpeed : newSpeed;
+
         // Обновляем пробы в новой физической позиции после подшага
-        const probeDirX = Math.hypot(cmdWorldX, cmdWorldZ) > 0.01 ? cmdWorldX : Math.sin(yaw);
-        const probeDirZ = Math.hypot(cmdWorldX, cmdWorldZ) > 0.01 ? cmdWorldZ : Math.cos(yaw);
-        updateProbes(currPosition.x, currPosition.z, probeDirX, probeDirZ);
+        const probeDirX = cmdDirLen > 0.01 ? cmdWorldX : (newSpeed > 0.08 ? velX / newSpeed : Math.sin(yaw));
+        const probeDirZ = cmdDirLen > 0.01 ? cmdWorldZ : (newSpeed > 0.08 ? velZ / newSpeed : Math.cos(yaw));
+        updateProbes(currPosition.x, currPosition.z, probeDirX, probeDirZ, currPosition.y);
 
         // === Генерация симуляционных событий контакта стоп с поверхностью ===
         const sinY = Math.sin(currYaw);
@@ -1070,6 +1292,8 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
 
     function reset(): void {
         crouch = 0;
+        prevCrouchInput = false;
+        pendingCrouchToggle = false;
         verticalVelocity = 0;
         isSliding = false;
         slideSpeed = 0;
@@ -1079,6 +1303,9 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         isSprinting = false;
         currentForwardSpeed = 0;
         currentForwardAccel = 0;
+        velX = 0;
+        velZ = 0;
+        yawAngularVel = 0;
         pendingContactEvents.length = 0;
         if (playerRig) {
             playerRig.setFeetPosition(position.x, position.y, position.z);
@@ -1210,6 +1437,32 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         return isSliding ? slideSpeed : currentForwardSpeed;
     }
 
+    function setPose(x: number, y: number, z: number, newYaw: number = yaw): void {
+        position.set(x, y, z);
+        prevPosition.copy(position);
+        currPosition.copy(position);
+        visualPosition.copy(position);
+        yaw = newYaw;
+        prevYaw = newYaw;
+        currYaw = newYaw;
+        visualYaw = newYaw;
+        flatFwd.set(Math.sin(newYaw), 0, Math.cos(newYaw));
+        visualFlatFwd.copy(flatFwd);
+        verticalVelocity = 0;
+        walkAmount = 0;
+        currentForwardSpeed = 0;
+        currentForwardAccel = 0;
+        velX = 0;
+        velZ = 0;
+        yawAngularVel = 0;
+        isSliding = false;
+        slideSpeed = 0;
+        if (playerRig) {
+            playerRig.setFeetPosition(x, y, z);
+        }
+        updateProbes(x, z, Math.sin(newYaw), Math.cos(newYaw));
+    }
+
     function dispose(): void {
         if (playerRig && !rig) {
             playerRig.dispose();
@@ -1218,6 +1471,7 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
 
     return {
         rig: playerRig,
+        onAction,
         update,
         simulateStep,
         consumeContactEvents,
@@ -1225,6 +1479,7 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         getProbes: () => probes,
         setModelDebug: (modelDebug: any) => { lastModelDebug = modelDebug; },
         setWaypoint,
+        setPose,
         reset,
         getPose,
         getVisualPose,
@@ -1234,3 +1489,4 @@ export function createPlayerController(options: PlayerControllerOptions = {}): P
         dispose
     };
 }
+

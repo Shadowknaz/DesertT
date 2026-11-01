@@ -25,6 +25,7 @@ export interface CameraDirectorOptions {
     controls?: { target?: THREE.Vector3; update?: () => void; minDistance?: number; maxDistance?: number } | null;
     getGroundHeight?: (x: number, z: number) => number;
     config?: Partial<CameraConfig>;
+    enablePointerLock?: boolean;
 }
 
 export interface CameraDirector {
@@ -51,7 +52,8 @@ export function createCameraDirector({
     domElement = null,
     controls = null,
     getGroundHeight = getDuneHeight,
-    config = CAMERA
+    config = CAMERA,
+    enablePointerLock
 }: CameraDirectorOptions): CameraDirector {
     const cameraFocus = new THREE.Vector3(0, config.focusHeight ?? CAMERA.focusHeight, 0);
     const previousFocus = new THREE.Vector3();
@@ -87,20 +89,34 @@ export function createCameraDirector({
     let activeGroundClearance = config.groundClearance ?? CAMERA.groundClearance;
 
     let isPointerLocked = false;
+    let pointerLockBlocked = false;
+    let isFreeLook = false;
+    let hasFreeLookOrigin = false;
     let isDragging = false;
     let lastPointerX = 0;
     let lastPointerY = 0;
+    let dragDistancePx = 0;
     let activePointerId = -1;
+
+    function isEmbeddedFrame(): boolean {
+        try {
+            return typeof window !== 'undefined' && Boolean(window.top) && window.self !== window.top;
+        } catch {
+            return true;
+        }
+    }
 
     // Вращение по азимуту (yaw вокруг персонажа)
     function rotateAzimuth(delta: number): void {
+        if (!Number.isFinite(delta)) return;
         targetTheta += delta;
         // Нормализация углов для избежания накопления огромных чисел
         const twoPi = Math.PI * 2;
-        if (targetTheta > Math.PI) {
+        while (targetTheta > Math.PI) {
             targetTheta -= twoPi;
             currentTheta -= twoPi;
-        } else if (targetTheta < -Math.PI) {
+        }
+        while (targetTheta < -Math.PI) {
             targetTheta += twoPi;
             currentTheta += twoPi;
         }
@@ -108,6 +124,7 @@ export function createCameraDirector({
 
     // Вращение по тангажу (pitch вверх/вниз)
     function rotatePolar(delta: number): void {
+        if (!Number.isFinite(delta)) return;
         targetPhi = THREE.MathUtils.clamp(targetPhi - delta, MIN_POLAR, MAX_POLAR);
     }
 
@@ -116,7 +133,7 @@ export function createCameraDirector({
         targetDistance = THREE.MathUtils.clamp(dist, minDistance, maxDistance);
     }
 
-    // Настройка камеры под конкретного актера (Мех vs Космо)
+    // Настройка камеры под конкретного актера (Мех vs Космо vs Транспорт)
     function setActorCamera(cfg?: Partial<CameraConfig> | null): void {
         if (!cfg) return;
         if (cfg.focusHeight !== undefined) activeFocusHeight = cfg.focusHeight;
@@ -137,24 +154,65 @@ export function createCameraDirector({
     function onPointerLockChange(): void {
         if (typeof document !== 'undefined') {
             isPointerLocked = (document.pointerLockElement === domElement);
+            if (!isPointerLocked) {
+                isFreeLook = false;
+                hasFreeLookOrigin = false;
+            }
         }
     }
 
+    function onPointerLockError(): void {
+        isPointerLocked = false;
+        pointerLockBlocked = true;
+        isFreeLook = true;
+    }
+
     function onPointerDown(e: PointerEvent | MouseEvent): void {
-        if (e.button === 0 || e.button === 2) {
+        if (e.button === 0 || e.button === 1 || e.button === 2) {
             isDragging = true;
             activePointerId = (e as PointerEvent).pointerId ?? 1;
             lastPointerX = e.clientX;
             lastPointerY = e.clientY;
+            dragDistancePx = 0;
+            const pe = e as PointerEvent;
+            if (domElement && typeof (domElement as any).setPointerCapture === 'function' && pe.pointerId !== undefined) {
+                try {
+                    (domElement as any).setPointerCapture(pe.pointerId);
+                } catch {
+                    // Игнорируем ошибку для синтетических событий в тестах
+                }
+            }
         }
+    }
+
+    function applyMouseLook(dAzimuth: number, dPolar: number): void {
+        rotateAzimuth(dAzimuth);
+        rotatePolar(dPolar);
+        currentTheta = THREE.MathUtils.lerp(currentTheta, targetTheta, 0.85);
+        currentPhi = THREE.MathUtils.lerp(currentPhi, targetPhi, 0.85);
     }
 
     function onPointerMove(e: PointerEvent | MouseEvent): void {
         if (isPointerLocked) {
             const mx = (e as MouseEvent).movementX ?? 0;
             const my = (e as MouseEvent).movementY ?? 0;
-            rotateAzimuth(-mx * SENSITIVITY_LOOK);
-            rotatePolar(-my * SENSITIVITY_LOOK);
+            applyMouseLook(-mx * SENSITIVITY_LOOK, -my * SENSITIVITY_LOOK);
+            return;
+        }
+
+        const buttons = typeof e.buttons === 'number' ? e.buttons : undefined;
+        if (!isDragging && buttons !== undefined && (buttons & 7) !== 0) {
+            isDragging = true;
+            activePointerId = (e as PointerEvent).pointerId ?? 1;
+            lastPointerX = e.clientX;
+            lastPointerY = e.clientY;
+            dragDistancePx = 0;
+            return;
+        }
+
+        if (isDragging && buttons === 0 && e.isTrusted) {
+            isDragging = false;
+            activePointerId = -1;
             return;
         }
 
@@ -163,8 +221,27 @@ export function createCameraDirector({
             const dy = e.clientY - lastPointerY;
             lastPointerX = e.clientX;
             lastPointerY = e.clientY;
-            rotateAzimuth(-dx * SENSITIVITY_DRAG);
-            rotatePolar(-dy * SENSITIVITY_DRAG);
+            if (Number.isFinite(dx) && Number.isFinite(dy)) {
+                dragDistancePx += Math.hypot(dx, dy);
+                applyMouseLook(-dx * SENSITIVITY_DRAG, -dy * SENSITIVITY_DRAG);
+            }
+            return;
+        }
+
+        if (isFreeLook) {
+            if (!hasFreeLookOrigin) {
+                lastPointerX = e.clientX;
+                lastPointerY = e.clientY;
+                hasFreeLookOrigin = true;
+                return;
+            }
+            const dx = e.clientX - lastPointerX;
+            const dy = e.clientY - lastPointerY;
+            lastPointerX = e.clientX;
+            lastPointerY = e.clientY;
+            if (Number.isFinite(dx) && Number.isFinite(dy)) {
+                applyMouseLook(-dx * SENSITIVITY_DRAG, -dy * SENSITIVITY_DRAG);
+            }
         }
     }
 
@@ -173,6 +250,13 @@ export function createCameraDirector({
         if (isDragging && (pe.pointerId === undefined || pe.pointerId === activePointerId)) {
             isDragging = false;
             activePointerId = -1;
+            if (domElement && typeof (domElement as any).releasePointerCapture === 'function' && pe.pointerId !== undefined) {
+                try {
+                    (domElement as any).releasePointerCapture(pe.pointerId);
+                } catch {
+                    // Игнорируем
+                }
+            }
         }
     }
 
@@ -188,22 +272,87 @@ export function createCameraDirector({
         }
     }
 
-    function onCanvasClick(): void {
-        if (typeof document !== 'undefined' && !document.pointerLockElement && domElement) {
-            if (typeof domElement.requestPointerLock === 'function') {
-                domElement.requestPointerLock();
+    function onKeyDown(e: KeyboardEvent): void {
+        if (e.code === 'Escape') {
+            isFreeLook = false;
+            hasFreeLookOrigin = false;
+        }
+    }
+
+    function onCanvasClick(e?: MouseEvent): void {
+        const wasDragged = dragDistancePx > 4;
+        dragDistancePx = 0;
+        if (wasDragged) return;
+
+        if (typeof document !== 'undefined' && document.body?.dataset?.buildMode === 'true') {
+            isFreeLook = false;
+            hasFreeLookOrigin = false;
+            return;
+        }
+
+        if (e && typeof e.clientX === 'number' && typeof e.clientY === 'number') {
+            lastPointerX = e.clientX;
+            lastPointerY = e.clientY;
+            hasFreeLookOrigin = true;
+        }
+
+        if (typeof document !== 'undefined' && domElement && document.pointerLockElement === domElement) {
+            if (typeof (document as any).exitPointerLock === 'function') {
+                try {
+                    (document as any).exitPointerLock();
+                } catch {
+                    // Игнорируем
+                }
             }
+            isFreeLook = false;
+            hasFreeLookOrigin = false;
+            return;
+        }
+
+        // Переключаем режим свободного обзора мышью по клику (работает и в iframe, и до ответа Pointer Lock)
+        isFreeLook = !isFreeLook;
+        if (!isFreeLook) {
+            hasFreeLookOrigin = false;
+            return;
+        }
+
+        const allowPointerLock = enablePointerLock ?? !isEmbeddedFrame();
+        if (!allowPointerLock || pointerLockBlocked) {
+            return;
+        }
+        if (typeof document === 'undefined' || !domElement) return;
+        if ('isConnected' in domElement && domElement.isConnected === false) return;
+        if (domElement.ownerDocument && domElement.ownerDocument !== document) return;
+        if (typeof domElement.requestPointerLock !== 'function') {
+            return;
+        }
+
+        try {
+            const lockPromise = domElement.requestPointerLock() as unknown as Promise<void> | void;
+            if (lockPromise && typeof (lockPromise as Promise<void>).catch === 'function') {
+                (lockPromise as Promise<void>).catch(() => {
+                    pointerLockBlocked = true;
+                    isPointerLocked = false;
+                    isFreeLook = true;
+                });
+            }
+        } catch {
+            pointerLockBlocked = true;
+            isPointerLocked = false;
+            isFreeLook = true;
         }
     }
 
     function onBlur(): void {
         isDragging = false;
+        isFreeLook = false;
+        hasFreeLookOrigin = false;
         activePointerId = -1;
     }
 
     // Подключение слушателей событий, если есть DOM
     if (domElement && typeof domElement.addEventListener === 'function') {
-        domElement.addEventListener('click', onCanvasClick);
+        domElement.addEventListener('click', onCanvasClick as EventListener);
         domElement.addEventListener('pointerdown', onPointerDown as EventListener);
         domElement.addEventListener('wheel', onWheel as EventListener, { passive: false });
         domElement.addEventListener('contextmenu', onContextMenu as EventListener);
@@ -212,10 +361,12 @@ export function createCameraDirector({
         window.addEventListener('pointermove', onPointerMove as EventListener);
         window.addEventListener('pointerup', onPointerUp as EventListener);
         window.addEventListener('pointercancel', onPointerUp as EventListener);
+        window.addEventListener('keydown', onKeyDown as EventListener);
         window.addEventListener('blur', onBlur);
     }
     if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
         document.addEventListener('pointerlockchange', onPointerLockChange);
+        document.addEventListener('pointerlockerror', onPointerLockError);
     }
 
     function follow(dt: number, targetPos: THREE.Vector3, focusHeight = activeFocusHeight, followGain = activeFollowGain): void {
@@ -290,7 +441,7 @@ export function createCameraDirector({
 
     function dispose(): void {
         if (domElement && typeof domElement.removeEventListener === 'function') {
-            domElement.removeEventListener('click', onCanvasClick);
+            domElement.removeEventListener('click', onCanvasClick as EventListener);
             domElement.removeEventListener('pointerdown', onPointerDown as EventListener);
             domElement.removeEventListener('wheel', onWheel as EventListener);
             domElement.removeEventListener('contextmenu', onContextMenu as EventListener);
@@ -299,10 +450,12 @@ export function createCameraDirector({
             window.removeEventListener('pointermove', onPointerMove as EventListener);
             window.removeEventListener('pointerup', onPointerUp as EventListener);
             window.removeEventListener('pointercancel', onPointerUp as EventListener);
+            window.removeEventListener('keydown', onKeyDown as EventListener);
             window.removeEventListener('blur', onBlur);
         }
         if (typeof document !== 'undefined' && typeof document.removeEventListener === 'function') {
             document.removeEventListener('pointerlockchange', onPointerLockChange);
+            document.removeEventListener('pointerlockerror', onPointerLockError);
         }
     }
 

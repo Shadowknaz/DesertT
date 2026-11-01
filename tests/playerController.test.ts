@@ -206,3 +206,48 @@ test('playerController accelerates on sprint action and does not trigger jump', 
     assert.equal(stepRes.support.plantedCount, 2);
 });
 
+test('playerController exhibits smooth stopping inertia, braking steps, and negative braking acceleration', () => {
+    const controller = createPlayerController({ groundAt: () => 0, speed: 2.8, runSpeed: 5.4 });
+    const dt = 1 / 60;
+
+    // Sprint forward for 35 frames (~0.58s) to reach full sprint momentum
+    for (let i = 0; i < 35; i++) {
+        const cmd = controller.update(dt, { actions: { forward: true, sprint: true }, cameraAzimuth: 0 });
+        controller.simulateStep(dt, cmd);
+    }
+
+    const stateAtRelease = controller.getVisualState(1.0);
+    const zAtRelease = stateAtRelease.position.z;
+    assert.ok((stateAtRelease.forwardSpeed ?? 0) > 4.2, `Cosmo must reach sprint speed before stopping (got ${stateAtRelease.forwardSpeed})`);
+
+    // Release all movement keys: Cosmo must NOT stop in 1 frame — he must decelerate over multiple frames with braking steps
+    const firstStopCmd = controller.update(dt, { actions: {}, cameraAzimuth: 0 });
+    controller.simulateStep(dt, firstStopCmd);
+    const stateFrame1 = controller.getVisualState(1.0);
+    const step1Dist = stateFrame1.position.z - zAtRelease;
+
+    assert.ok(step1Dist > 0.04, `Cosmo must continue moving forward by inertia on the first frame after key release (dz=${step1Dist})`);
+    assert.ok((stateFrame1.forwardSpeed ?? 0) > 3.5, `Speed must decay gradually, not drop to 0 in one frame (got ${stateFrame1.forwardSpeed})`);
+    assert.ok(stateFrame1.walkAmount > 0.5, `Cosmo must keep stepping during braking run-out (walkAmount=${stateFrame1.walkAmount})`);
+    assert.ok((stateFrame1.forwardAccel ?? 0) < -1.0, `Braking must produce negative forwardAccel for torso/pelvis weight transfer (got ${stateFrame1.forwardAccel})`);
+
+    // Continue simulating until Cosmo comes to a complete stop
+    let minBrakingAccel = stateFrame1.forwardAccel ?? 0;
+    for (let i = 0; i < 60; i++) {
+        const cmd = controller.update(dt, { actions: {}, cameraAzimuth: 0 });
+        controller.simulateStep(dt, cmd);
+        const st = controller.getVisualState(1.0);
+        if ((st.forwardAccel ?? 0) < minBrakingAccel) {
+            minBrakingAccel = st.forwardAccel ?? 0;
+        }
+    }
+
+    const finalState = controller.getVisualState(1.0);
+    const totalBrakingDist = finalState.position.z - zAtRelease;
+    assert.ok(totalBrakingDist > 0.65 && totalBrakingDist < 2.5, `Cosmo 85kg sprint braking distance should be 0.65..2.5m (got ${totalBrakingDist})`);
+    assert.ok(minBrakingAccel < -4.0, `Peak braking deceleration must be strongly negative (got ${minBrakingAccel})`);
+    assert.equal(finalState.forwardSpeed, 0, 'Cosmo must come to a complete rest after braking run-out');
+    assert.equal(finalState.walkAmount, 0, 'Walk amount must settle to 0 once stopped');
+});
+
+

@@ -19,10 +19,11 @@ export function applyPS1VertexSnap<T extends THREE.Material>(material: T, snapRe
             mvPosition = modelViewMatrix * mvPosition;
             gl_Position = projectionMatrix * mvPosition;
             // Эмуляция целочисленной математики GTE чипа PlayStation 1
-            gl_Position.xyz = gl_Position.xyz / gl_Position.w;
-            gl_Position.x = floor(uSnapRes * gl_Position.x) / uSnapRes;
-            gl_Position.y = floor(uSnapRes * gl_Position.y) / uSnapRes;
-            gl_Position.xyz *= gl_Position.w;
+            if (gl_Position.w > 0.05) {
+                float invW = 1.0 / gl_Position.w;
+                gl_Position.x = (floor(uSnapRes * gl_Position.x * invW) / uSnapRes) * gl_Position.w;
+                gl_Position.y = (floor(uSnapRes * gl_Position.y * invW) / uSnapRes) * gl_Position.w;
+            }
             `
         );
     };
@@ -85,10 +86,11 @@ export function applyDesertSurfaceShader<T extends THREE.Material>(
             mvPosition = modelViewMatrix * mvPosition;
             gl_Position = projectionMatrix * mvPosition;
             // Эмуляция целочисленной математики GTE чипа PlayStation 1
-            gl_Position.xyz = gl_Position.xyz / gl_Position.w;
-            gl_Position.x = floor(uSnapRes * gl_Position.x) / uSnapRes;
-            gl_Position.y = floor(uSnapRes * gl_Position.y) / uSnapRes;
-            gl_Position.xyz *= gl_Position.w;
+            if (gl_Position.w > 0.05) {
+                float invW = 1.0 / gl_Position.w;
+                gl_Position.x = (floor(uSnapRes * gl_Position.x * invW) / uSnapRes) * gl_Position.w;
+                gl_Position.y = (floor(uSnapRes * gl_Position.y * invW) / uSnapRes) * gl_Position.w;
+            }
             `
         );
 

@@ -116,3 +116,87 @@ test('cameraDirector rotates azimuth and polar with clamping', () => {
     director.follow(0.5, new THREE.Vector3(0, 0, 0));
     assert.ok(director.getPolar() <= Math.PI * 0.48);
 });
+
+test('cameraDirector safely catches rejected pointer lock promises and suppresses retries when root document is invalid', async t => {
+    const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    const docTarget = new EventTarget() as any;
+    docTarget.pointerLockElement = null;
+    Object.defineProperty(globalThis, 'document', { value: docTarget, configurable: true });
+    t.after(() => {
+        if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+        else delete (globalThis as any).document;
+    });
+
+    const domTarget = new EventTarget() as any;
+    let requestCalls = 0;
+    domTarget.isConnected = true;
+    domTarget.ownerDocument = docTarget;
+    domTarget.requestPointerLock = () => {
+        requestCalls++;
+        return Promise.reject(new Error('The root document of this element is not valid for pointer lock.'));
+    };
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+    camera.position.set(0, 5, 10);
+    const director = createCameraDirector({
+        camera,
+        domElement: domTarget,
+        enablePointerLock: true,
+        getGroundHeight: () => 0
+    });
+
+    // Clicking should invoke requestPointerLock once, catch its rejection without unhandledrejection, and block further calls
+    domTarget.dispatchEvent(new Event('click'));
+    await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(requestCalls, 1);
+    assert.equal(director.isPointerLocked(), false);
+
+    // Subsequent clicks must not call requestPointerLock again once blocked
+    domTarget.dispatchEvent(new Event('click'));
+    assert.equal(requestCalls, 1);
+
+    director.dispose();
+});
+
+test('cameraDirector skips pointer lock inside embedded iframes by default and after drag gestures', t => {
+    const previousDocument = Object.getOwnPropertyDescriptor(globalThis, 'document');
+    const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    const docTarget = new EventTarget() as any;
+    docTarget.pointerLockElement = null;
+
+    const winTarget = new EventTarget() as any;
+    // Simulate embedded iframe (window.self !== window.top)
+    winTarget.self = winTarget;
+    winTarget.top = {};
+
+    Object.defineProperty(globalThis, 'document', { value: docTarget, configurable: true });
+    Object.defineProperty(globalThis, 'window', { value: winTarget, configurable: true });
+    t.after(() => {
+        if (previousDocument) Object.defineProperty(globalThis, 'document', previousDocument);
+        else delete (globalThis as any).document;
+        if (previousWindow) Object.defineProperty(globalThis, 'window', previousWindow);
+        else delete (globalThis as any).window;
+    });
+
+    const domTarget = new EventTarget() as any;
+    let requestCalls = 0;
+    domTarget.isConnected = true;
+    domTarget.ownerDocument = docTarget;
+    domTarget.requestPointerLock = () => {
+        requestCalls++;
+    };
+
+    const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+    camera.position.set(0, 5, 10);
+    const director = createCameraDirector({
+        camera,
+        domElement: domTarget,
+        getGroundHeight: () => 0
+    });
+
+    domTarget.dispatchEvent(new Event('click'));
+    assert.equal(requestCalls, 0, 'Embedded iframe must not trigger pointer lock on click by default');
+
+    director.dispose();
+});
+
